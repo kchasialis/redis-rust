@@ -9,7 +9,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::io::Result;
 use std::time::Duration;
-use crate::resp_types::{RespValue};
+use crate::resp_types::{RespKey, RespValue};
 use crate::resp_types::RespKey::SimpleString;
 use crate::storage::StorageValue;
 use std::collections::HashMap;
@@ -28,15 +28,6 @@ fn handle_echo_cmd(args: &Vec<RespValue>) -> RespValue {
 
 async fn handle_set_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
     eprintln!("Received SET command");
-
-    let key = match &args[1] {
-        RespValue::BulkString(k) => k.clone(),
-        _ => panic!("SET: expected bulk string type for key")
-    };
-    let value = match &args[2] {
-        RespValue::BulkString(v) => v.clone(),
-        _ => panic!("SET: expected bulk string type for value")
-    };
 
     let mut expiry_duration: Option<Duration> = None;
     if args.len() == 5 {
@@ -65,27 +56,58 @@ async fn handle_set_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
         }
     }
 
-    storage.write().await.insert(key, StorageValue::new(value, expiry_duration));
+    storage.write().await.insert(args[1].clone().into(),
+                                 StorageValue::new(args[2].clone(), expiry_duration));
     RespValue::SimpleString("OK".to_string())
 }
 
 async fn handle_get_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
     eprintln!("[DEBUG] Received GET command");
 
-    let key = match &args[1] {
-        RespValue::BulkString(k) => k,
-        _ => panic!("GET: expected bulk string type for key")
-    };
+    let key = RespKey::from(args[1].clone());
 
-    let value_opt = storage.read().await.get(key).and_then(|val| val.data()).cloned();
+    let value_opt = storage.read().await.get(&key)
+        .and_then(|val| val.data()).cloned();
 
     match value_opt {
-        Some(vec) => RespValue::BulkString(vec),
+        Some(val) => val,
         None => {
-            storage.write().await.remove(key);
+            storage.write().await.remove(&key);
             RespValue::NullBulkString
         }
     }
+}
+
+async fn handle_rpush_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
+    let key = RespKey::from(args[1].clone());
+
+    let mut guard = storage.write().await;
+
+    let list_len = match guard.get_mut(&key) {
+        Some(storage_val) => {
+            match storage_val.data_mut() {
+                Some(RespValue::Array(vec)) => {
+                    vec.push(args[2].clone());
+                    vec.len()
+                }
+                Some(_) => panic!("RPUSH: key exists but is not an array"),
+                None => {
+                    let list = vec![args[2].clone()];
+                    let len = list.len();
+                    *storage_val = StorageValue::new(RespValue::Array(list), None);
+                    len
+                }
+            }
+        }
+        None => {
+            let list = vec![args[2].clone()];
+            let len = list.len();
+            guard.insert(key, StorageValue::new(RespValue::Array(list), None));
+            len
+        }
+    };
+
+    RespValue::Integer(list_len as i64)
 }
 
 async fn handle_connection(mut stream: TcpStream, storage: Storage) -> Result<()> {
@@ -117,6 +139,8 @@ async fn handle_connection(mut stream: TcpStream, storage: Storage) -> Result<()
                            response = handle_set_cmd(arr, storage.clone()).await;
                        } else if cmd == b"GET" {
                            response = handle_get_cmd(arr, storage.clone()).await;
+                       } else if cmd == b"RPUSH" {
+                           response = handle_rpush_cmd(arr, storage.clone()).await;
                        } else {
                            panic!("Received unsupported command")
                        }

@@ -39,7 +39,7 @@ pub enum RespValue {
     Push(Vec<RespValue>),
 }
 
-impl RespKey {
+impl From<RespValue> for RespKey {
     fn from(val: RespValue) -> Self {
         match val {
             RespValue::SimpleString(v) => RespKey::SimpleString(v),
@@ -51,8 +51,10 @@ impl RespKey {
             _ => panic!("Unsupported type for map key: {:?}", val),
         }
     }
+}
 
-    fn serialize_into(&self, buf: &mut Vec<u8>) {
+impl RespKey {
+fn serialize_into(&self, buf: &mut Vec<u8>) {
         match self {
             RespKey::SimpleString(s) => {
                 buf.push(b'+');
