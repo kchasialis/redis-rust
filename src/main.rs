@@ -171,12 +171,27 @@ async fn handle_lpop_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
         Some(storage_val) => {
             match storage_val.data_mut() {
                 Some(RespValue::Array(vec)) => {
-                    if vec.len() == 0 {
-                        return RespValue::NullBulkString;
+                    if args.len() == 3 {
+                        let mut elems_to_remove = parse_int_from_bulk_str(&args[2]) as usize;
+                        if elems_to_remove >= vec.len() {
+                            elems_to_remove = vec.len();
+                        }
+
+                        let mut result = vec![];
+                        for _ in 0..elems_to_remove {
+                            let val = vec[0].clone();
+                            vec.remove(0);
+                            result.push(val);
+                        }
+                        RespValue::Array(result)
+                    } else {
+                        if vec.len() == 0 {
+                            return RespValue::NullBulkString;
+                        }
+                        let val = vec[0].clone();
+                        vec.remove(0);
+                        val
                     }
-                    let val = vec[0].clone();
-                    vec.remove(0);
-                    val
                 }
                 Some(_) => panic!("LPOP: key exists but is not an array"),
                 None => {
