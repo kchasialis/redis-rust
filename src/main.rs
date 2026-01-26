@@ -136,7 +136,7 @@ async fn handle_lpush_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue 
                     }
                     vec.len()
                 }
-                Some(_) => panic!("RPUSH: key exists but is not an array"),
+                Some(_) => panic!("LPUSH: key exists but is not an array"),
                 None => {
                     let mut list = Vec::new();
                     for arg in &args[2..] {
@@ -160,6 +160,34 @@ async fn handle_lpush_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue 
     };
 
     RespValue::Integer(list_len as i64)
+}
+
+async fn handle_lpop_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
+    let key = RespKey::from(args[1].clone());
+
+    let mut guard = storage.write().await;
+
+    match guard.get_mut(&key) {
+        Some(storage_val) => {
+            match storage_val.data_mut() {
+                Some(RespValue::Array(vec)) => {
+                    if vec.len() == 0 {
+                        return RespValue::NullBulkString;
+                    }
+                    let val = vec[0].clone();
+                    vec.remove(0);
+                    val
+                }
+                Some(_) => panic!("LPOP: key exists but is not an array"),
+                None => {
+                    RespValue::NullBulkString
+                }
+            }
+        }
+        None => {
+            RespValue::NullBulkString
+        }
+    }
 }
 
 async fn handle_lrange_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
@@ -253,6 +281,8 @@ async fn handle_connection(mut stream: TcpStream, storage: Storage) -> Result<()
                            response = handle_rpush_cmd(arr, storage.clone()).await;
                        } else if cmd == b"LPUSH" {
                            response = handle_lpush_cmd(arr, storage.clone()).await;
+                       } else if cmd == b"LPOP" {
+                           response = handle_lpop_cmd(arr, storage.clone()).await;
                        } else if cmd == b"LRANGE" {
                            response = handle_lrange_cmd(arr, storage.clone()).await;
                        } else if cmd == b"LLEN" {
