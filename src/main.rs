@@ -87,12 +87,17 @@ async fn handle_rpush_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue 
         Some(storage_val) => {
             match storage_val.data_mut() {
                 Some(RespValue::Array(vec)) => {
-                    vec.push(args[2].clone());
+                    for arg in &args[2..] {
+                        vec.push(arg.clone());
+                    }
                     vec.len()
                 }
                 Some(_) => panic!("RPUSH: key exists but is not an array"),
                 None => {
-                    let list = vec![args[2].clone()];
+                    let mut list = Vec::new();
+                    for arg in &args[2..] {
+                        list.push(arg.clone());
+                    }
                     let len = list.len();
                     *storage_val = StorageValue::new(RespValue::Array(list), None);
                     len
@@ -100,7 +105,10 @@ async fn handle_rpush_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue 
             }
         }
         None => {
-            let list = vec![args[2].clone()];
+            let mut list = Vec::new();
+            for arg in &args[2..] {
+                list.push(arg.clone());
+            }
             let len = list.len();
             guard.insert(key, StorageValue::new(RespValue::Array(list), None));
             len
