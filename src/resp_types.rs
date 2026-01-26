@@ -24,6 +24,7 @@ pub enum RespValue {
     Array(Vec<RespValue>),
     Null,
     NullArray,
+    NullBulkString,
     Boolean(bool),
     Double(OrderedFloat<f64>),
     BigNumber(String),
@@ -137,6 +138,9 @@ impl RespValue {
             }
             RespValue::NullArray => {
                 buf.extend_from_slice(b"*-1\r\n");
+            }
+            RespValue::NullBulkString => {
+                buf.extend_from_slice(b"$-1\r\n");
             }
             RespValue::Boolean(b) => {
                 buf.push(b'#');

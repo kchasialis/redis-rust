@@ -1,18 +1,20 @@
 #![allow(unused_imports)]
 
 mod resp_types;
+mod storage;
+use storage::Storage;
 
 use std::io::{Read, Write};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::io::Result;
+use std::time::Duration;
 use crate::resp_types::{RespValue};
 use crate::resp_types::RespKey::SimpleString;
+use crate::storage::StorageValue;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-
-type Storage = Arc<RwLock<HashMap<Vec<u8>, Vec<u8>>>>;
 
 fn handle_ping_cmd() -> RespValue {
     eprintln!("Received PING command");
@@ -36,21 +38,53 @@ async fn handle_set_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
         _ => panic!("SET: expected bulk string type for value")
     };
 
-    storage.write().await.insert(key, value);
+    let mut expiry_duration: Option<Duration> = None;
+    if args.len() == 5 {
+        let expiry_type = match &args[3] {
+            RespValue::BulkString(v) => v,
+            _ => panic!("SET: expected bulk string type for expiry type")
+        };
+        let expiry_value = match &args[4] {
+            RespValue::BulkString(v) => {
+                std::str::from_utf8(v)
+                    .expect("SET: invalid UTF-8 in expiry value")
+                    .parse::<u64>()
+                    .expect("SET: invalid number for expiry value")
+            }
+            _ => panic!("SET: expected bulk string type for expiry value")
+        };
+
+        eprintln!("[DEBUG] Received expiry_type: {:?}, expiry_value: {}", String::from_utf8(expiry_type.clone()), expiry_value);
+
+        if expiry_type.eq(b"EX") {
+            expiry_duration = Some(Duration::from_secs(expiry_value));
+        } else if expiry_type.eq(b"PX") {
+            expiry_duration = Some(Duration::from_millis(expiry_value));
+        } else {
+            panic!("SET: unhandled specifier for expiry time type")
+        }
+    }
+
+    storage.write().await.insert(key, StorageValue::new(value, expiry_duration));
     RespValue::SimpleString("OK".to_string())
 }
 
 async fn handle_get_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
-    eprintln!("Received GET command");
+    eprintln!("[DEBUG] Received GET command");
 
     let key = match &args[1] {
         RespValue::BulkString(k) => k,
         _ => panic!("GET: expected bulk string type for key")
     };
 
-    match storage.read().await.get(key) {
-        Some(val) => RespValue::BulkString(val.clone()),
-        None => RespValue::BulkString(b"$-1\r\n".to_vec())
+    let value_opt = storage.read().await.get(key).and_then(|val| val.data()).cloned();
+
+    match value_opt {
+        Some(vec) => RespValue::BulkString(vec),
+        None => {
+            storage.write().await.remove(key);
+            RespValue::NullBulkString
+        }
     }
 }
 
