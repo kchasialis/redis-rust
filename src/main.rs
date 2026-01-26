@@ -125,15 +125,8 @@ async fn handle_rpush_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue 
 async fn handle_lrange_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
     let key = RespKey::from(args[1].clone());
 
-    let start = match args[2] {
-        RespValue::Integer(n) => n,
-        _ => panic!("LRANGE: expected integer for start index")
-    };
-
-    let stop = match args[3] {
-        RespValue::Integer(n) => n,
-        _ => panic!("LRANGE: expected integer for stop index")
-    };
+    let start = parse_int_from_bulk_str(&args[2]);
+    let stop = parse_int_from_bulk_str(&args[3]);
 
     let value_opt = storage.read().await.get(&key)
         .and_then(|val| val.data()).cloned();
