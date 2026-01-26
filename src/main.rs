@@ -10,7 +10,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::io::Result;
 use std::time::Duration;
 use crate::resp_types::{RespKey, RespValue};
-use crate::resp_types::RespKey::SimpleString;
+use crate::resp_types::RespKey::{BulkString, SimpleString};
 use crate::storage::StorageValue;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -26,6 +26,18 @@ fn handle_echo_cmd(args: &Vec<RespValue>) -> RespValue {
     args[1].clone()
 }
 
+fn parse_int_from_bulk_str(resp_val: &RespValue) -> i64 {
+    match resp_val {
+        RespValue::BulkString(v) => {
+            std::str::from_utf8(v)
+                .expect("Error in parsing int from resp_value (bulk_str): Invalid UTF-8")
+                .parse::<i64>()
+                .expect("Error in parsing int from resp_value (bulk_str): Invalid number")
+        }
+        _ => panic!("Expected bulk string type for command argument")
+    }
+}
+
 async fn handle_set_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
     eprintln!("Received SET command");
 
@@ -35,15 +47,7 @@ async fn handle_set_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
             RespValue::BulkString(v) => v,
             _ => panic!("SET: expected bulk string type for expiry type")
         };
-        let expiry_value = match &args[4] {
-            RespValue::BulkString(v) => {
-                std::str::from_utf8(v)
-                    .expect("SET: invalid UTF-8 in expiry value")
-                    .parse::<u64>()
-                    .expect("SET: invalid number for expiry value")
-            }
-            _ => panic!("SET: expected bulk string type for expiry value")
-        };
+        let expiry_value = parse_int_from_bulk_str(&args[4]) as u64;
 
         eprintln!("[DEBUG] Received expiry_type: {:?}, expiry_value: {}", String::from_utf8(expiry_type.clone()), expiry_value);
 
@@ -118,6 +122,39 @@ async fn handle_rpush_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue 
     RespValue::Integer(list_len as i64)
 }
 
+async fn handle_lrange_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
+    let key = RespKey::from(args[1].clone());
+
+    let start_idx = parse_int_from_bulk_str(&args[2]);
+    let mut stop_idx = parse_int_from_bulk_str(&args[3]);
+
+    let value_opt = storage.read().await.get(&key)
+        .and_then(|val| val.data()).cloned();
+
+    match value_opt {
+        Some(RespValue::Array(vec)) => {
+            let len = vec.len() as i64;
+            if start_idx >= len || start_idx >= stop_idx {
+                return RespValue::Array(vec![])
+            }
+            if stop_idx >= len {
+                stop_idx = len - 1;
+            }
+
+            let result = vec[start_idx as usize..(stop_idx + 1) as usize]
+            .iter()
+            .cloned()
+            .collect();
+            RespValue::Array(result)
+        },
+        Some(_) => panic!("LRANGE: key exists but is not an array"),
+        None => {
+            storage.write().await.remove(&key);
+            RespValue::Array(vec![])
+        }
+    }
+}
+
 async fn handle_connection(mut stream: TcpStream, storage: Storage) -> Result<()> {
    let mut buf = [0u8; 1024];
    loop {
@@ -149,6 +186,8 @@ async fn handle_connection(mut stream: TcpStream, storage: Storage) -> Result<()
                            response = handle_get_cmd(arr, storage.clone()).await;
                        } else if cmd == b"RPUSH" {
                            response = handle_rpush_cmd(arr, storage.clone()).await;
+                       } else if cmd == b"LRANGE" {
+                           response = handle_lrange_cmd(arr, storage.clone()).await;
                        } else {
                            panic!("Received unsupported command")
                        }
