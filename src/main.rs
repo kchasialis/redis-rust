@@ -19,6 +19,8 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::sync::mpsc;
 use std::collections::VecDeque;
+use std::time;
+use tokio::time::timeout;
 use crate::task_communication::{Channels, WaiterRegistry};
 
 fn handle_ping_cmd() -> RespValue {
@@ -37,6 +39,18 @@ fn parse_int_from_bulk_str(resp_val: &RespValue) -> i64 {
             std::str::from_utf8(v)
                 .expect("Error in parsing int from resp_value (bulk_str): Invalid UTF-8")
                 .parse::<i64>()
+                .expect("Error in parsing int from resp_value (bulk_str): Invalid number")
+        }
+        _ => panic!("Expected bulk string type for command argument")
+    }
+}
+
+fn parse_float_from_bulk_str(resp_val: &RespValue) -> f64 {
+    match resp_val {
+        RespValue::BulkString(v) => {
+            std::str::from_utf8(v)
+                .expect("Error in parsing int from resp_value (bulk_str): Invalid UTF-8")
+                .parse::<f64>()
                 .expect("Error in parsing int from resp_value (bulk_str): Invalid number")
         }
         _ => panic!("Expected bulk string type for command argument")
@@ -226,6 +240,7 @@ async fn handle_lpop_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
 
 async fn handle_blpop_cmd(args: &Vec<RespValue>, storage: Storage, channels: Channels) -> RespValue {
     let key = RespKey::from(args[1].clone());
+    let timeout_secs = parse_float_from_bulk_str(&args[2]);
 
     {
         let mut guard = storage.write().await;
@@ -251,7 +266,14 @@ async fn handle_blpop_cmd(args: &Vec<RespValue>, storage: Storage, channels: Cha
         .or_insert_with(|| WaiterRegistry { senders: VecDeque::new() })
         .add_waiter(tx);
 
-    rx.recv().await.unwrap_or(RespValue::NullArray)
+    if timeout_secs == 0.0 {
+        rx.recv().await.unwrap_or(RespValue::NullArray)
+    } else {
+        match timeout(Duration::from_secs_f64(timeout_secs), rx.recv()).await {
+            Ok(Some(response)) => response,
+            Ok(None) | Err(_) => RespValue::NullArray,
+        }
+    }
 }
 
 async fn handle_lrange_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
