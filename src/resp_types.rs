@@ -4,6 +4,7 @@ use std::str::FromStr;
 use std::string::ParseError;
 use ordered_float::OrderedFloat;
 use crate::resp_types::RespValue::NullArray;
+use std::collections::VecDeque;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum RespKey {
@@ -21,7 +22,7 @@ pub enum RespValue {
     SimpleError(String),
     Integer(i64),
     BulkString(Vec<u8>),
-    Array(Vec<RespValue>),
+    Array(VecDeque<RespValue>),
     Null,
     NullArray,
     NullBulkString,
@@ -307,10 +308,10 @@ fn parse_array(input: &[u8]) -> Result<(RespValue, &[u8])> {
                 return Ok((NullArray, rest))
             }
 
-            let mut elements = Vec::new();
+            let mut elements = VecDeque::new();
             for _ in 0..length {
                 let (value, rem) = parse_resp_bytes(rest)?;
-                elements.push(value);
+                elements.push_back(value);
                 rest = rem;
             }
             Ok((RespValue::Array(elements), rest))

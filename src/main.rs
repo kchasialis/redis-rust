@@ -2,6 +2,8 @@
 
 mod resp_types;
 mod storage;
+mod task_communication;
+
 use storage::Storage;
 
 use std::io::{Read, Write};
@@ -15,6 +17,9 @@ use crate::storage::StorageValue;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tokio::sync::mpsc;
+use std::collections::VecDeque;
+use crate::task_communication::{Channels, WaiterRegistry};
 
 fn handle_ping_cmd() -> RespValue {
     eprintln!("Received PING command");
@@ -82,7 +87,7 @@ async fn handle_get_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
     }
 }
 
-async fn handle_rpush_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
+async fn handle_rpush_cmd(args: &Vec<RespValue>, storage: Storage, channels: Channels) -> RespValue {
     let key = RespKey::from(args[1].clone());
 
     let mut guard = storage.write().await;
@@ -92,15 +97,15 @@ async fn handle_rpush_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue 
             match storage_val.data_mut() {
                 Some(RespValue::Array(vec)) => {
                     for arg in &args[2..] {
-                        vec.push(arg.clone());
+                        vec.push_back(arg.clone());
                     }
                     vec.len()
                 }
                 Some(_) => panic!("RPUSH: key exists but is not an array"),
                 None => {
-                    let mut list = Vec::new();
+                    let mut list = VecDeque::new();
                     for arg in &args[2..] {
-                        list.push(arg.clone());
+                        list.push_back(arg.clone());
                     }
                     let len = list.len();
                     *storage_val = StorageValue::new(RespValue::Array(list), None);
@@ -109,20 +114,34 @@ async fn handle_rpush_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue 
             }
         }
         None => {
-            let mut list = Vec::new();
+            let mut list = VecDeque::new();
             for arg in &args[2..] {
-                list.push(arg.clone());
+                list.push_back(arg.clone());
             }
             let len = list.len();
-            guard.insert(key, StorageValue::new(RespValue::Array(list), None));
+            guard.insert(key.clone(), StorageValue::new(RespValue::Array(list), None));
             len
         }
     };
 
+    if let Some(sender) = channels.write().await.get_mut(&key).and_then(|reg| reg.pop_waiter()) {
+        if let Some(storage_val) = guard.get_mut(&key) {
+            if let Some(RespValue::Array(vec)) = storage_val.data_mut() {
+                if let Some(popped) = vec.pop_front() {
+                    let mut vec = VecDeque::new();
+                    vec.push_back(args[1].clone());
+                    vec.push_back(popped);
+                    let response = RespValue::Array(vec);
+                    sender.send(response).await.ok();
+                }
+            }
+        }
+    }
+
     RespValue::Integer(list_len as i64)
 }
 
-async fn handle_lpush_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
+async fn handle_lpush_cmd(args: &Vec<RespValue>, storage: Storage, channels: Channels) -> RespValue {
     let key = RespKey::from(args[1].clone());
 
     let mut guard = storage.write().await;
@@ -132,15 +151,15 @@ async fn handle_lpush_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue 
             match storage_val.data_mut() {
                 Some(RespValue::Array(vec)) => {
                     for arg in &args[2..] {
-                        vec.insert(0, arg.clone());
+                        vec.push_front(arg.clone());
                     }
                     vec.len()
                 }
                 Some(_) => panic!("LPUSH: key exists but is not an array"),
                 None => {
-                    let mut list = Vec::new();
+                    let mut list = VecDeque::new();
                     for arg in &args[2..] {
-                        list.insert(0, arg.clone());
+                        list.push_front(arg.clone());
                     }
                     let len = list.len();
                     *storage_val = StorageValue::new(RespValue::Array(list), None);
@@ -149,9 +168,9 @@ async fn handle_lpush_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue 
             }
         }
         None => {
-            let mut list = Vec::new();
+            let mut list = VecDeque::new();
             for arg in &args[2..] {
-                list.insert(0, arg.clone());
+                list.push_front(arg.clone());
             }
             let len = list.len();
             guard.insert(key, StorageValue::new(RespValue::Array(list), None));
@@ -177,11 +196,11 @@ async fn handle_lpop_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
                             elems_to_remove = vec.len();
                         }
 
-                        let mut result = vec![];
+                        let mut result = VecDeque::new();
                         for _ in 0..elems_to_remove {
                             let val = vec[0].clone();
-                            vec.remove(0);
-                            result.push(val);
+                            vec.pop_front();
+                            result.push_back(val);
                         }
                         RespValue::Array(result)
                     } else {
@@ -189,7 +208,7 @@ async fn handle_lpop_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
                             return RespValue::NullBulkString;
                         }
                         let val = vec[0].clone();
-                        vec.remove(0);
+                        vec.pop_front();
                         val
                     }
                 }
@@ -203,6 +222,36 @@ async fn handle_lpop_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
             RespValue::NullBulkString
         }
     }
+}
+
+async fn handle_blpop_cmd(args: &Vec<RespValue>, storage: Storage, channels: Channels) -> RespValue {
+    let key = RespKey::from(args[1].clone());
+
+    {
+        let mut guard = storage.write().await;
+        if let Some(storage_val) = guard.get_mut(&key) {
+            if let Some(RespValue::Array(deque)) = storage_val.data_mut() {
+                if !deque.is_empty() {
+                    let popped = deque.pop_front().unwrap();
+                    let mut vec = VecDeque::new();
+                    vec.push_back(args[1].clone());
+                    vec.push_back(popped);
+                    return RespValue::Array(vec);
+                }
+            }
+        }
+    }
+
+    eprintln!("[DEBUG] BLPOP: List empty, registering waiter for key");
+
+    let (tx, mut rx) = mpsc::channel(1);
+
+    channels.write().await
+        .entry(key)
+        .or_insert_with(|| WaiterRegistry { senders: VecDeque::new() })
+        .add_waiter(tx);
+
+    rx.recv().await.unwrap_or(RespValue::NullArray)
 }
 
 async fn handle_lrange_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
@@ -231,16 +280,19 @@ async fn handle_lrange_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue
             } as usize;
 
             if start_idx >= stop_idx || start_idx >= vec.len() {
-                return RespValue::Array(vec![]);
+                return RespValue::Array(VecDeque::new());
             }
 
-            let result = vec[start_idx..stop_idx].to_vec();
+            let mut result = VecDeque::new();
+            for i in start_idx..stop_idx {
+                result.push_back(vec[i].clone());
+            }
             RespValue::Array(result)
         }
         Some(_) => panic!("LRANGE: key exists but is not an array"),
         None => {
             storage.write().await.remove(&key);
-            RespValue::Array(vec![])
+            RespValue::Array(VecDeque::new())
         }
     }
 }
@@ -263,7 +315,7 @@ async fn handle_llen_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
     }
 }
 
-async fn handle_connection(mut stream: TcpStream, storage: Storage) -> Result<()> {
+async fn handle_connection(mut stream: TcpStream, storage: Storage, channels: Channels) -> Result<()> {
    let mut buf = [0u8; 1024];
    loop {
        let _ = match stream.read(&mut buf).await {
@@ -280,28 +332,31 @@ async fn handle_connection(mut stream: TcpStream, storage: Storage) -> Result<()
 
        let val = RespValue::deserialize(&buf).unwrap();
        match &val {
-           RespValue::Array(arr) => {
+           RespValue::Array(deque) => {
+               let arr: Vec<RespValue> = deque.iter().cloned().collect();
                match &arr[0] {
                    RespValue::BulkString(cmd) => {
                        let response;
                        if cmd == b"PING" {
                            response = handle_ping_cmd();
                        } else if cmd == b"ECHO" {
-                           response = handle_echo_cmd(arr);
+                           response = handle_echo_cmd(&arr);
                        } else if cmd == b"SET" {
-                           response = handle_set_cmd(arr, storage.clone()).await;
+                           response = handle_set_cmd(&arr, storage.clone()).await;
                        } else if cmd == b"GET" {
-                           response = handle_get_cmd(arr, storage.clone()).await;
+                           response = handle_get_cmd(&arr, storage.clone()).await;
                        } else if cmd == b"RPUSH" {
-                           response = handle_rpush_cmd(arr, storage.clone()).await;
+                           response = handle_rpush_cmd(&arr, storage.clone(), channels.clone()).await;
                        } else if cmd == b"LPUSH" {
-                           response = handle_lpush_cmd(arr, storage.clone()).await;
+                           response = handle_lpush_cmd(&arr, storage.clone(), channels.clone()).await;
                        } else if cmd == b"LPOP" {
-                           response = handle_lpop_cmd(arr, storage.clone()).await;
+                           response = handle_lpop_cmd(&arr, storage.clone()).await;
+                       } else if cmd == b"BLPOP" {
+                           response = handle_blpop_cmd(&arr, storage.clone(), channels.clone()).await;
                        } else if cmd == b"LRANGE" {
-                           response = handle_lrange_cmd(arr, storage.clone()).await;
+                           response = handle_lrange_cmd(&arr, storage.clone()).await;
                        } else if cmd == b"LLEN" {
-                           response = handle_llen_cmd(arr, storage.clone()).await;
+                           response = handle_llen_cmd(&arr, storage.clone()).await;
                        } else {
                            panic!("Received unsupported command")
                        }
@@ -320,6 +375,7 @@ async fn main() -> Result<()> {
     println!("Logs from your program will appear here!");
 
     let storage: Storage = Arc::new(RwLock::new(HashMap::new()));
+    let channels: Channels = Arc::new(RwLock::new(HashMap::new()));
 
     let listener = TcpListener::bind("127.0.0.1:6379").await?;
     loop {
@@ -328,8 +384,9 @@ async fn main() -> Result<()> {
         eprintln!("Accepted a client!");
 
         let storage_clone = Arc::clone(&storage);
+        let channels_clone = Arc::clone(&channels);
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(socket, storage_clone).await {
+            if let Err(e) = handle_connection(socket, storage_clone, channels_clone).await {
                 eprintln!("connection error: {:?}", e);
             }
         });
