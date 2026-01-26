@@ -125,8 +125,15 @@ async fn handle_rpush_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue 
 async fn handle_lrange_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
     let key = RespKey::from(args[1].clone());
 
-    let start_idx = parse_int_from_bulk_str(&args[2]);
-    let mut stop_idx = parse_int_from_bulk_str(&args[3]);
+    let start = match args[2] {
+        RespValue::Integer(n) => n,
+        _ => panic!("LRANGE: expected integer for start index")
+    };
+
+    let stop = match args[3] {
+        RespValue::Integer(n) => n,
+        _ => panic!("LRANGE: expected integer for stop index")
+    };
 
     let value_opt = storage.read().await.get(&key)
         .and_then(|val| val.data()).cloned();
@@ -134,19 +141,26 @@ async fn handle_lrange_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue
     match value_opt {
         Some(RespValue::Array(vec)) => {
             let len = vec.len() as i64;
-            if start_idx >= len || start_idx >= stop_idx {
-                return RespValue::Array(vec![])
-            }
-            if stop_idx >= len {
-                stop_idx = len - 1;
+
+            let start_idx = if start < 0 {
+                (len + start).max(0)
+            } else {
+                start.min(len)
+            } as usize;
+
+            let stop_idx = if stop < 0 {
+                (len + stop + 1).max(0)
+            } else {
+                (stop + 1).min(len)
+            } as usize;
+
+            if start_idx >= stop_idx || start_idx >= vec.len() {
+                return RespValue::Array(vec![]);
             }
 
-            let result = vec[start_idx as usize..(stop_idx + 1) as usize]
-            .iter()
-            .cloned()
-            .collect();
+            let result = vec[start_idx..stop_idx].to_vec();
             RespValue::Array(result)
-        },
+        }
         Some(_) => panic!("LRANGE: key exists but is not an array"),
         None => {
             storage.write().await.remove(&key);
