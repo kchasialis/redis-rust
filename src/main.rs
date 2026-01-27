@@ -337,6 +337,24 @@ async fn handle_llen_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
     }
 }
 
+async fn handle_type_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
+    let key = RespKey::from(args[1].clone());
+
+    let value_opt = storage.read().await.get(&key)
+        .and_then(|val| val.data()).cloned();
+
+    match value_opt {
+        Some(RespValue::SimpleString(_)) | Some(RespValue::BulkString(_)) => {
+            RespValue::SimpleString("string".to_string())
+        }
+        Some(_) => panic!("LRANGE: key exists but is not an array"),
+        None => {
+            storage.write().await.remove(&key);
+            RespValue::SimpleString("none".to_string())
+        }
+    }
+}
+
 async fn handle_connection(mut stream: TcpStream, storage: Storage, channels: Channels) -> Result<()> {
    let mut buf = [0u8; 1024];
    loop {
@@ -379,6 +397,8 @@ async fn handle_connection(mut stream: TcpStream, storage: Storage, channels: Ch
                            response = handle_lrange_cmd(&arr, storage.clone()).await;
                        } else if cmd == b"LLEN" {
                            response = handle_llen_cmd(&arr, storage.clone()).await;
+                       } else if cmd == b"TYPE" {
+                           response = handle_type_cmd(&arr, storage.clone()).await;
                        } else {
                            panic!("Received unsupported command")
                        }
