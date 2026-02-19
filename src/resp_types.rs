@@ -1,10 +1,11 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::{Debug, Display, Formatter};
 use std::str::FromStr;
 use std::string::ParseError;
 use ordered_float::OrderedFloat;
 use crate::resp_types::RespValue::NullArray;
 use std::collections::VecDeque;
+use std::cmp::Ordering;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum RespKey {
@@ -14,6 +15,28 @@ pub enum RespKey {
     Boolean(bool),
     Double(OrderedFloat<f64>),
     BigNumber(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct StreamId {
+    milliseconds: u64,
+    sequence: u64,
+}
+
+impl From<RespValue> for StreamId {
+    fn from(val: RespValue) -> Self {
+        match val {
+            RespValue::BulkString(v) => {
+                let v_str = String::from_utf8(v).unwrap();
+                let parts: Vec<&str> = v_str.split('-').collect();
+                StreamId {
+                    milliseconds: parts[0].parse::<u64>().unwrap(),
+                    sequence: parts[1].parse::<u64>().unwrap()
+                }
+            }
+            _ => panic!("Unsupported type for stream id: {:?}", val),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +61,7 @@ pub enum RespValue {
     Attribute(HashMap<RespKey, RespValue>),
     Set(HashSet<RespKey>),
     Push(Vec<RespValue>),
+    Stream(BTreeMap<StreamId, HashMap<RespKey, RespValue>>)
 }
 
 impl From<RespValue> for RespKey {
@@ -218,6 +242,9 @@ impl RespValue {
                 for elem in arr {
                     elem.serialize_into(buf);
                 }
+            }
+            RespValue::Stream(_) => {
+                panic!("Not handled yet")
             }
         }
     }

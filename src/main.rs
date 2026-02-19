@@ -11,10 +11,10 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::io::Result;
 use std::time::Duration;
-use crate::resp_types::{RespKey, RespValue};
+use crate::resp_types::{RespKey, RespValue, StreamId};
 use crate::resp_types::RespKey::{BulkString, SimpleString};
 use crate::storage::StorageValue;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::sync::mpsc;
@@ -347,12 +347,52 @@ async fn handle_type_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
         Some(RespValue::SimpleString(_)) | Some(RespValue::BulkString(_)) => {
             RespValue::SimpleString("string".to_string())
         }
+        Some(RespValue::Stream(_)) => {
+            RespValue::SimpleString("stream".to_string())
+        }
         Some(_) => panic!("LRANGE: key exists but is not an array"),
         None => {
             storage.write().await.remove(&key);
             RespValue::SimpleString("none".to_string())
         }
     }
+}
+
+async fn handle_xadd_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
+    let key = RespKey::from(args[1].clone());
+    let stream_id = StreamId::from(args[2].clone());
+
+    let mut guard = storage.write().await;
+
+    match guard.get_mut(&key) {
+        Some(storage_val) => {
+            match storage_val.data_mut() {
+                Some(RespValue::Stream(map)) => {
+                    let entry = map.entry(stream_id).or_insert_with(HashMap::new);
+                    let mut i = 3;
+                    while i < args.len() - 1 {
+                        entry.insert(RespKey::from(args[i].clone()), args[i + 1].clone());
+                        i += 2;
+                    }
+                }
+                Some(_) => panic!("XADD: key exists but is not a stream"),
+                None => panic!("XADD: key expired")
+            }
+        }
+        None => {
+            let mut map = BTreeMap::new();
+            let mut hashmap = HashMap::new();
+            let mut i = 3;
+            while i < args.len() - 1 {
+                hashmap.insert(RespKey::from(args[i].clone()), args[i + 1].clone());
+                i += 2;
+            }
+            map.insert(stream_id, hashmap);
+            guard.insert(key, StorageValue::new(RespValue::Stream(map), None));
+        }
+    }
+
+    args[2].clone()
 }
 
 async fn handle_connection(mut stream: TcpStream, storage: Storage, channels: Channels) -> Result<()> {
@@ -399,6 +439,8 @@ async fn handle_connection(mut stream: TcpStream, storage: Storage, channels: Ch
                            response = handle_llen_cmd(&arr, storage.clone()).await;
                        } else if cmd == b"TYPE" {
                            response = handle_type_cmd(&arr, storage.clone()).await;
+                       } else if cmd == b"XADD" {
+                            response = handle_xadd_cmd(&arr, storage.clone()).await;
                        } else {
                            panic!("Received unsupported command")
                        }
