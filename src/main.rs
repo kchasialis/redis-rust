@@ -368,6 +368,14 @@ async fn handle_xadd_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
         Some(storage_val) => {
             match storage_val.data_mut() {
                 Some(RespValue::Stream(map)) => {
+                    if let Some(last_id) = map.keys().next_back() {
+                        if stream_id <= *last_id {
+                            return RespValue::SimpleError(
+                                "ERR The ID specified in XADD is equal or smaller than the target stream top item".to_string()
+                            );
+                        }
+                    }
+
                     let entry = map.entry(stream_id).or_insert_with(HashMap::new);
                     let mut i = 3;
                     while i < args.len() - 1 {
