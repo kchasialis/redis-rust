@@ -362,6 +362,12 @@ async fn handle_xadd_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
     let key = RespKey::from(args[1].clone());
     let stream_id = StreamId::from(args[2].clone());
 
+    if stream_id.sequence == 0 && stream_id.milliseconds == 0 {
+        return RespValue::SimpleError(
+            "ERR The ID specified in XADD must be greater than 0-0".to_string()
+        )
+    }
+
     let mut guard = storage.write().await;
 
     match guard.get_mut(&key) {
@@ -370,10 +376,9 @@ async fn handle_xadd_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
                 Some(RespValue::Stream(map)) => {
                     if let Some(last_id) = map.keys().next_back() {
                         if stream_id <= *last_id {
-                            let ms = last_id.milliseconds;
-                            let seq = last_id.sequence;
-                            let s = format!("ERR The ID specified in XADD must be greater than {}-{}", ms, seq);
-                            return RespValue::SimpleError(s);
+                            return RespValue::SimpleError(
+                                "ERR The ID specified in XADD is equal or smaller than the target stream top item".to_string()
+                            );
                         }
                     }
 
