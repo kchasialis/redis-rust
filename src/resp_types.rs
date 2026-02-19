@@ -19,8 +19,8 @@ pub enum RespKey {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct StreamId {
-    milliseconds: u64,
-    sequence: u64,
+    pub milliseconds: u64,
+    pub sequence: u64,
 }
 
 impl From<RespValue> for StreamId {
