@@ -19,7 +19,7 @@ pub enum RespKey {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct StreamId {
-    pub milliseconds: u64,
+    pub milliseconds: Option<u64>,
     pub sequence: Option<u64>,
 }
 
@@ -28,9 +28,15 @@ impl From<RespValue> for StreamId {
         match val {
             RespValue::BulkString(v) => {
                 let v_str = String::from_utf8(v).unwrap();
+                if v_str.eq("*") {
+                    return StreamId {
+                        milliseconds: None,
+                        sequence: None
+                    }
+                }
                 let parts: Vec<&str> = v_str.split('-').collect();
                 StreamId {
-                    milliseconds: parts[0].parse::<u64>().unwrap(),
+                    milliseconds: parts[0].parse::<u64>().ok(),
                     sequence: parts[1].parse::<u64>().ok()
                 }
             }

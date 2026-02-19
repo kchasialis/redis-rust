@@ -10,7 +10,7 @@ use std::io::{Read, Write};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::io::Result;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::resp_types::{RespKey, RespValue, StreamId};
 use crate::resp_types::RespKey::{BulkString, SimpleString};
 use crate::storage::StorageValue;
@@ -361,10 +361,17 @@ async fn handle_xadd_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
     let key = RespKey::from(args[1].clone());
     let mut stream_id = StreamId::from(args[2].clone());
 
-    if stream_id.sequence == Some(0) && stream_id.milliseconds == 0 {
+    if stream_id.sequence == Some(0) && stream_id.milliseconds == Some(0) {
         return RespValue::SimpleError(
             "ERR The ID specified in XADD must be greater than 0-0".to_string()
         )
+    }
+
+    if stream_id.milliseconds.is_none() {
+        stream_id.milliseconds = Some(SystemTime::now()
+                                          .duration_since(UNIX_EPOCH)
+                                          .unwrap()
+                                          .as_millis() as u64);
     }
 
     let mut guard = storage.write().await;
@@ -382,7 +389,7 @@ async fn handle_xadd_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
                         stream_id.sequence = match same_ms_last {
                             Some((last_id, _)) => Some(last_id.sequence.unwrap() + 1),
                             None => {
-                                if stream_id.milliseconds == 0 { Some(1) } else { Some(0) }
+                                if stream_id.milliseconds == Some(0) { Some(1) } else { Some(0) }
                             }
                         };
                     }
@@ -416,14 +423,14 @@ async fn handle_xadd_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
             }
 
             if stream_id.sequence.is_none() {
-                stream_id.sequence = if stream_id.milliseconds == 0 { Some(1) } else { Some(0) }
+                stream_id.sequence = if stream_id.milliseconds == Some(0) { Some(1) } else { Some(0) }
             }
             map.insert(stream_id.clone(), hashmap);
             guard.insert(key, StorageValue::new(RespValue::Stream(map), None));
         }
     }
 
-    RespValue::BulkString(format!("{}-{}", stream_id.milliseconds, stream_id.sequence.unwrap()).into())
+    RespValue::BulkString(format!("{}-{}", stream_id.milliseconds.unwrap(), stream_id.sequence.unwrap()).into())
 }
 
 async fn handle_connection(mut stream: TcpStream, storage: Storage, channels: Channels) -> Result<()> {
