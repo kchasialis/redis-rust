@@ -20,7 +20,7 @@ pub enum RespKey {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct StreamId {
     pub milliseconds: u64,
-    pub sequence: u64,
+    pub sequence: Option<u64>,
 }
 
 impl From<RespValue> for StreamId {
@@ -31,7 +31,7 @@ impl From<RespValue> for StreamId {
                 let parts: Vec<&str> = v_str.split('-').collect();
                 StreamId {
                     milliseconds: parts[0].parse::<u64>().unwrap(),
-                    sequence: parts[1].parse::<u64>().unwrap()
+                    sequence: parts[1].parse::<u64>().ok()
                 }
             }
             _ => panic!("Unsupported type for stream id: {:?}", val),

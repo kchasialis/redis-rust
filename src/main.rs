@@ -21,6 +21,7 @@ use tokio::sync::mpsc;
 use std::collections::VecDeque;
 use std::time;
 use tokio::time::timeout;
+use std::ops::Bound;
 use crate::task_communication::{Channels, WaiterRegistry};
 
 fn handle_ping_cmd() -> RespValue {
@@ -257,8 +258,6 @@ async fn handle_blpop_cmd(args: &Vec<RespValue>, storage: Storage, channels: Cha
         }
     }
 
-    eprintln!("[DEBUG] BLPOP: List empty, registering waiter for key");
-
     let (tx, mut rx) = mpsc::channel(1);
 
     channels.write().await
@@ -360,9 +359,9 @@ async fn handle_type_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
 
 async fn handle_xadd_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
     let key = RespKey::from(args[1].clone());
-    let stream_id = StreamId::from(args[2].clone());
+    let mut stream_id = StreamId::from(args[2].clone());
 
-    if stream_id.sequence == 0 && stream_id.milliseconds == 0 {
+    if stream_id.sequence == Some(0) && stream_id.milliseconds == 0 {
         return RespValue::SimpleError(
             "ERR The ID specified in XADD must be greater than 0-0".to_string()
         )
@@ -374,6 +373,20 @@ async fn handle_xadd_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
         Some(storage_val) => {
             match storage_val.data_mut() {
                 Some(RespValue::Stream(map)) => {
+                    let same_ms_last = map.range(
+                        StreamId { milliseconds: stream_id.milliseconds, sequence: Some(0) }..=
+                            StreamId { milliseconds: stream_id.milliseconds, sequence: Some(u64::MAX) }
+                    ).next_back();
+
+                    if stream_id.sequence.is_none() {
+                        stream_id.sequence = match same_ms_last {
+                            Some((last_id, _)) => Some(last_id.sequence.unwrap() + 1),
+                            None => {
+                                if stream_id.milliseconds == 0 { Some(1) } else { Some(0) }
+                            }
+                        };
+                    }
+
                     if let Some(last_id) = map.keys().next_back() {
                         if stream_id <= *last_id {
                             return RespValue::SimpleError(
@@ -382,7 +395,7 @@ async fn handle_xadd_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
                         }
                     }
 
-                    let entry = map.entry(stream_id).or_insert_with(HashMap::new);
+                    let entry = map.entry(stream_id.clone()).or_insert_with(HashMap::new);
                     let mut i = 3;
                     while i < args.len() - 1 {
                         entry.insert(RespKey::from(args[i].clone()), args[i + 1].clone());
@@ -401,12 +414,16 @@ async fn handle_xadd_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
                 hashmap.insert(RespKey::from(args[i].clone()), args[i + 1].clone());
                 i += 2;
             }
-            map.insert(stream_id, hashmap);
+
+            if stream_id.sequence.is_none() {
+                stream_id.sequence = if stream_id.milliseconds == 0 { Some(1) } else { Some(0) }
+            }
+            map.insert(stream_id.clone(), hashmap);
             guard.insert(key, StorageValue::new(RespValue::Stream(map), None));
         }
     }
 
-    args[2].clone()
+    RespValue::BulkString(format!("{}-{}", stream_id.milliseconds, stream_id.sequence.unwrap()).into())
 }
 
 async fn handle_connection(mut stream: TcpStream, storage: Storage, channels: Channels) -> Result<()> {
