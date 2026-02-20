@@ -15,6 +15,7 @@ use crate::resp_types::{RespKey, RespValue, StreamId};
 use crate::resp_types::RespKey::{BulkString, SimpleString};
 use crate::storage::StorageValue;
 use std::collections::{BTreeMap, HashMap};
+use std::ops::Bound::{Excluded, Unbounded};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::sync::mpsc;
@@ -482,6 +483,47 @@ async fn handle_xrange_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue
     }
 }
 
+async fn handle_xread_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
+    let key = RespKey::from(args[2].clone());
+    let id = StreamId::from(args[3].clone());
+
+    let value_opt = storage.read().await.get(&key)
+        .and_then(|val| val.data()).cloned();
+
+    match value_opt {
+        Some(RespValue::Stream(map)) => {
+            let range = map.range((Excluded(&id), Unbounded));
+            let mut ret_vec = VecDeque::new();
+            let mut entries_vec = VecDeque::new();
+            ret_vec.push_back(args[2].clone());
+            for (sid, hashmap) in range {
+                let mut inner_vec = VecDeque::new();
+                for entry in hashmap {
+                    inner_vec.push_back(RespValue::from(entry.0.clone()));
+                    inner_vec.push_back(entry.1.clone());
+                }
+
+                let mut entry_vec = VecDeque::new();
+                entry_vec.push_back(RespValue::BulkString(sid.to_string().into_bytes()));
+                entry_vec.push_back(RespValue::Array(inner_vec));
+
+                entries_vec.push_back(RespValue::Array(entry_vec));
+            }
+
+            ret_vec.push_back(RespValue::Array(entries_vec));
+            let mut rec_rec_vec = VecDeque::new();
+            rec_rec_vec.push_back(RespValue::Array(ret_vec));
+
+            RespValue::Array(rec_rec_vec)
+        }
+        Some(_) => panic!("XRANGE: key exists but is not an array"),
+        None => {
+            storage.write().await.remove(&key);
+            RespValue::Array(VecDeque::new())
+        }
+    }
+}
+
 async fn handle_connection(mut stream: TcpStream, storage: Storage, channels: Channels) -> Result<()> {
    let mut buf = [0u8; 1024];
    loop {
@@ -529,7 +571,9 @@ async fn handle_connection(mut stream: TcpStream, storage: Storage, channels: Ch
                        } else if cmd == b"XADD" {
                            response = handle_xadd_cmd(&arr, storage.clone()).await;
                        } else if cmd == b"XRANGE" {
-                            response = handle_xrange_cmd(&arr, storage.clone()).await;
+                           response = handle_xrange_cmd(&arr, storage.clone()).await;
+                       } else if cmd == b"XREAD" {
+                           response = handle_xread_cmd(&arr, storage.clone()).await;
                        } else {
                            panic!("Received unsupported command")
                        }
