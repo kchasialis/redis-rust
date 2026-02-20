@@ -484,44 +484,50 @@ async fn handle_xrange_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue
 }
 
 async fn handle_xread_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
-    let key = RespKey::from(args[2].clone());
-    let id = StreamId::from(args[3].clone());
+    let key_start_idx = 2;
+    let n_keys = (args.len() - 2) / 2;
+    let id_start_idx = key_start_idx + n_keys;
 
-    let value_opt = storage.read().await.get(&key)
-        .and_then(|val| val.data()).cloned();
+    let mut streams_vec = VecDeque::new();
+    for i in 0..n_keys {
+        let key = RespKey::from(args[key_start_idx + i].clone());
+        let id = StreamId::from(args[id_start_idx + i].clone());
 
-    match value_opt {
-        Some(RespValue::Stream(map)) => {
-            let range = map.range((Excluded(&id), Unbounded));
-            let mut ret_vec = VecDeque::new();
-            let mut entries_vec = VecDeque::new();
-            ret_vec.push_back(args[2].clone());
-            for (sid, hashmap) in range {
-                let mut inner_vec = VecDeque::new();
-                for entry in hashmap {
-                    inner_vec.push_back(RespValue::from(entry.0.clone()));
-                    inner_vec.push_back(entry.1.clone());
+        let value_opt = storage.read().await.get(&key)
+            .and_then(|val| val.data()).cloned();
+
+        match value_opt {
+            Some(RespValue::Stream(map)) => {
+                let range = map.range((Excluded(&id), Unbounded));
+                let mut stream_vec = VecDeque::new();
+                let mut entries_vec = VecDeque::new();
+                stream_vec.push_back(args[key_start_idx + i].clone());
+                for (sid, hashmap) in range {
+                    let mut inner_vec = VecDeque::new();
+                    for entry in hashmap {
+                        inner_vec.push_back(RespValue::from(entry.0.clone()));
+                        inner_vec.push_back(entry.1.clone());
+                    }
+
+                    let mut entry_vec = VecDeque::new();
+                    entry_vec.push_back(RespValue::BulkString(sid.to_string().into_bytes()));
+                    entry_vec.push_back(RespValue::Array(inner_vec));
+
+                    entries_vec.push_back(RespValue::Array(entry_vec));
                 }
 
-                let mut entry_vec = VecDeque::new();
-                entry_vec.push_back(RespValue::BulkString(sid.to_string().into_bytes()));
-                entry_vec.push_back(RespValue::Array(inner_vec));
-
-                entries_vec.push_back(RespValue::Array(entry_vec));
+                stream_vec.push_back(RespValue::Array(entries_vec));
+                streams_vec.push_back(RespValue::Array(stream_vec));
             }
-
-            ret_vec.push_back(RespValue::Array(entries_vec));
-            let mut rec_rec_vec = VecDeque::new();
-            rec_rec_vec.push_back(RespValue::Array(ret_vec));
-
-            RespValue::Array(rec_rec_vec)
-        }
-        Some(_) => panic!("XRANGE: key exists but is not an array"),
-        None => {
-            storage.write().await.remove(&key);
-            RespValue::Array(VecDeque::new())
+            Some(_) => panic!("XRANGE: key exists but is not an array"),
+            None => {
+                storage.write().await.remove(&key);
+                streams_vec.push_back(RespValue::Array(VecDeque::new()));
+            }
         }
     }
+
+    RespValue::Array(streams_vec)
 }
 
 async fn handle_connection(mut stream: TcpStream, storage: Storage, channels: Channels) -> Result<()> {
