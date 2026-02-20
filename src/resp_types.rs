@@ -6,6 +6,7 @@ use ordered_float::OrderedFloat;
 use crate::resp_types::RespValue::NullArray;
 use std::collections::VecDeque;
 use std::cmp::Ordering;
+use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum RespKey {
@@ -21,6 +22,17 @@ pub enum RespKey {
 pub struct StreamId {
     pub milliseconds: Option<u64>,
     pub sequence: Option<u64>,
+}
+
+impl Display for StreamId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match (self.milliseconds, self.sequence) {
+            (Some(ms), Some(seq)) => write!(f, "{}-{}", ms, seq),
+            (Some(ms), None)      => write!(f, "{}-*", ms),
+            (None, Some(seq))     => write!(f, "*-{}", seq),
+            (None, None)          => write!(f, "*"),
+        }
+    }
 }
 
 impl From<RespValue> for StreamId {
@@ -84,8 +96,27 @@ impl From<RespValue> for RespKey {
     }
 }
 
+impl From<RespKey> for RespValue {
+    fn from(key: RespKey) -> Self {
+        match key {
+            RespKey::SimpleString(v) => RespValue::SimpleString(v),
+            RespKey::Integer(v)      => RespValue::Integer(v),
+            RespKey::BulkString(v)   => RespValue::BulkString(v),
+            RespKey::Boolean(v)      => RespValue::Boolean(v),
+            RespKey::Double(v)       => RespValue::Double(v),
+            RespKey::BigNumber(v)    => RespValue::BigNumber(v),
+        }
+    }
+}
+
 impl RespKey {
-fn serialize_into(&self, buf: &mut Vec<u8>) {
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        self.serialize_into(&mut buf);
+        buf
+    }
+
+    fn serialize_into(&self, buf: &mut Vec<u8>) {
         match self {
             RespKey::SimpleString(s) => {
                 buf.push(b'+');
