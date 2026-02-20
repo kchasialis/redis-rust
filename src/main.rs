@@ -494,14 +494,31 @@ async fn handle_xrange_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue
 }
 
 async fn handle_xread_cmd(args: &Vec<RespValue>, storage: Storage, channels: Channels) -> RespValue {
-    let xread_type = parse_str_from_bulk_str(&args[1]);
+    let is_blocking = parse_str_from_bulk_str(&args[1]).eq("block");
 
-    let mut n_init_args = 2;
-    if xread_type.eq("block") {
-        n_init_args = 4;
+    let key_start_idx = if is_blocking { 4 } else { 2 };
+    let n_keys = (args.len() - key_start_idx) / 2;
+    let id_start_idx = key_start_idx + n_keys;
+
+    let ids: Vec<StreamId> = {
+        let guard = storage.read().await;
+        (0..n_keys).map(|i| {
+            let id_str = parse_str_from_bulk_str(&args[id_start_idx + i]);
+            if id_str.eq("$") {
+                let key = RespKey::from(args[key_start_idx + i].clone());
+                guard.get(&key)
+                    .and_then(|val| val.data())
+                    .and_then(|v| if let RespValue::Stream(map) = v { map.keys().next_back().cloned() } else { None })
+                    .unwrap_or(StreamId { milliseconds: Some(0), sequence: Some(0) })
+            } else {
+                StreamId::from(args[id_start_idx + i].clone())
+            }
+        }).collect()
+    };
+
+    if is_blocking {
         let timeout_ms = parse_int_from_bulk_str(&args[2]) as u64;
-        let key = RespKey::from(args[4].clone());
-
+        let key = RespKey::from(args[key_start_idx].clone());
         let (tx, mut rx) = mpsc::channel(1);
 
         channels.write().await
@@ -509,46 +526,36 @@ async fn handle_xread_cmd(args: &Vec<RespValue>, storage: Storage, channels: Cha
             .or_insert_with(|| WaiterRegistry { senders: VecDeque::new() })
             .add_waiter(tx);
 
-        /* Block and wait for notification from XADD. */
-        if timeout_ms == 0 {
-            if let None = rx.recv().await {
-                return RespValue::NullArray
-            }
+        let timed_out = if timeout_ms == 0 {
+            rx.recv().await.is_none()
         } else {
             match timeout(Duration::from_millis(timeout_ms), rx.recv()).await {
-                Ok(Some(_)) => {},
-                Ok(None) | Err(_) => {
-                    return RespValue::NullArray
-                }
+                Ok(Some(_)) => false,
+                Ok(None) | Err(_) => true,
             }
+        };
+
+        if timed_out {
+            return RespValue::NullArray;
         }
     }
 
-    let key_start_idx = n_init_args;
-    let n_keys = (args.len() - n_init_args) / 2;
-    let id_start_idx = key_start_idx + n_keys;
-
+    let guard = storage.read().await;
     let mut streams_vec = VecDeque::new();
+
     for i in 0..n_keys {
         let key = RespKey::from(args[key_start_idx + i].clone());
-        let id = StreamId::from(args[id_start_idx + i].clone());
 
-        let value_opt = storage.read().await.get(&key)
-            .and_then(|val| val.data()).cloned();
-
-        match value_opt {
+        match guard.get(&key).and_then(|val| val.data()) {
             Some(RespValue::Stream(map)) => {
-                let entries = build_entries_vec(map.range((Excluded(&id), Unbounded)));
+                let entries = build_entries_vec(map.range((Excluded(&ids[i]), Unbounded)));
                 let mut stream_vec = VecDeque::new();
                 stream_vec.push_back(args[key_start_idx + i].clone());
                 stream_vec.push_back(RespValue::Array(entries));
                 streams_vec.push_back(RespValue::Array(stream_vec));
             }
             Some(_) => panic!("XREAD: key exists but is not a stream"),
-            None => {
-                storage.write().await.remove(&key);
-                streams_vec.push_back(RespValue::Array(VecDeque::new()));
-            }
+            None => streams_vec.push_back(RespValue::NullArray),
         }
     }
 
