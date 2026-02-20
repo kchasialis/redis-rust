@@ -20,6 +20,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::sync::mpsc;
 use std::collections::VecDeque;
+use std::fmt::Debug;
 use std::time;
 use tokio::time::timeout;
 use std::ops::Bound;
@@ -59,9 +60,16 @@ fn parse_float_from_bulk_str(resp_val: &RespValue) -> f64 {
     }
 }
 
-async fn handle_set_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
-    eprintln!("Received SET command");
+fn parse_str_from_bulk_str(resp_val: &RespValue) -> String {
+    match resp_val {
+        RespValue::BulkString(v) => {
+            std::str::from_utf8(v).unwrap().to_lowercase()
+        }
+        _ => panic!("Expected bulk string type for command argument")
+    }
+}
 
+async fn handle_set_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
     let mut expiry_duration: Option<Duration> = None;
     if args.len() == 5 {
         let expiry_type = match &args[3] {
@@ -69,8 +77,6 @@ async fn handle_set_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
             _ => panic!("SET: expected bulk string type for expiry type")
         };
         let expiry_value = parse_int_from_bulk_str(&args[4]) as u64;
-
-        eprintln!("[DEBUG] Received expiry_type: {:?}, expiry_value: {}", String::from_utf8(expiry_type.clone()), expiry_value);
 
         if expiry_type.eq(b"EX") {
             expiry_duration = Some(Duration::from_secs(expiry_value));
@@ -87,8 +93,6 @@ async fn handle_set_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
 }
 
 async fn handle_get_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
-    eprintln!("[DEBUG] Received GET command");
-
     let key = RespKey::from(args[1].clone());
 
     let value_opt = storage.read().await.get(&key)
@@ -157,7 +161,7 @@ async fn handle_rpush_cmd(args: &Vec<RespValue>, storage: Storage, channels: Cha
     RespValue::Integer(list_len as i64)
 }
 
-async fn handle_lpush_cmd(args: &Vec<RespValue>, storage: Storage, channels: Channels) -> RespValue {
+async fn handle_lpush_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
     let key = RespKey::from(args[1].clone());
 
     let mut guard = storage.write().await;
@@ -358,7 +362,7 @@ async fn handle_type_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
     }
 }
 
-async fn handle_xadd_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
+async fn handle_xadd_cmd(args: &Vec<RespValue>, storage: Storage, channels: Channels) -> RespValue {
     let key = RespKey::from(args[1].clone());
     let mut stream_id = StreamId::from(args[2].clone());
 
@@ -375,63 +379,85 @@ async fn handle_xadd_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
                                           .as_millis() as u64);
     }
 
-    let mut guard = storage.write().await;
+    {
+        let mut guard = storage.write().await;
 
-    match guard.get_mut(&key) {
-        Some(storage_val) => {
-            match storage_val.data_mut() {
-                Some(RespValue::Stream(map)) => {
-                    let same_ms_last = map.range(
-                        StreamId { milliseconds: stream_id.milliseconds, sequence: Some(0) }..=
-                            StreamId { milliseconds: stream_id.milliseconds, sequence: Some(u64::MAX) }
-                    ).next_back();
+        match guard.get_mut(&key) {
+            Some(storage_val) => {
+                match storage_val.data_mut() {
+                    Some(RespValue::Stream(map)) => {
+                        let same_ms_last = map.range(
+                            StreamId { milliseconds: stream_id.milliseconds, sequence: Some(0) }..=
+                                StreamId { milliseconds: stream_id.milliseconds, sequence: Some(u64::MAX) }
+                        ).next_back();
 
-                    if stream_id.sequence.is_none() {
-                        stream_id.sequence = match same_ms_last {
-                            Some((last_id, _)) => Some(last_id.sequence.unwrap() + 1),
-                            None => {
-                                if stream_id.milliseconds == Some(0) { Some(1) } else { Some(0) }
+                        if stream_id.sequence.is_none() {
+                            stream_id.sequence = match same_ms_last {
+                                Some((last_id, _)) => Some(last_id.sequence.unwrap() + 1),
+                                None => {
+                                    if stream_id.milliseconds == Some(0) { Some(1) } else { Some(0) }
+                                }
+                            };
+                        }
+
+                        if let Some(last_id) = map.keys().next_back() {
+                            if stream_id <= *last_id {
+                                return RespValue::SimpleError(
+                                    "ERR The ID specified in XADD is equal or smaller than the target stream top item".to_string()
+                                );
                             }
-                        };
-                    }
+                        }
 
-                    if let Some(last_id) = map.keys().next_back() {
-                        if stream_id <= *last_id {
-                            return RespValue::SimpleError(
-                                "ERR The ID specified in XADD is equal or smaller than the target stream top item".to_string()
-                            );
+                        let entry = map.entry(stream_id.clone()).or_insert_with(HashMap::new);
+                        let mut i = 3;
+                        while i < args.len() - 1 {
+                            entry.insert(RespKey::from(args[i].clone()), args[i + 1].clone());
+                            i += 2;
                         }
                     }
-
-                    let entry = map.entry(stream_id.clone()).or_insert_with(HashMap::new);
-                    let mut i = 3;
-                    while i < args.len() - 1 {
-                        entry.insert(RespKey::from(args[i].clone()), args[i + 1].clone());
-                        i += 2;
-                    }
+                    Some(_) => panic!("XADD: key exists but is not a stream"),
+                    None => panic!("XADD: key expired")
                 }
-                Some(_) => panic!("XADD: key exists but is not a stream"),
-                None => panic!("XADD: key expired")
             }
-        }
-        None => {
-            let mut map = BTreeMap::new();
-            let mut hashmap = HashMap::new();
-            let mut i = 3;
-            while i < args.len() - 1 {
-                hashmap.insert(RespKey::from(args[i].clone()), args[i + 1].clone());
-                i += 2;
-            }
+            None => {
+                let mut map = BTreeMap::new();
+                let mut hashmap = HashMap::new();
+                let mut i = 3;
+                while i < args.len() - 1 {
+                    hashmap.insert(RespKey::from(args[i].clone()), args[i + 1].clone());
+                    i += 2;
+                }
 
-            if stream_id.sequence.is_none() {
-                stream_id.sequence = if stream_id.milliseconds == Some(0) { Some(1) } else { Some(0) }
+                if stream_id.sequence.is_none() {
+                    stream_id.sequence = if stream_id.milliseconds == Some(0) { Some(1) } else { Some(0) }
+                }
+                map.insert(stream_id.clone(), hashmap);
+                guard.insert(key.clone(), StorageValue::new(RespValue::Stream(map), None));
             }
-            map.insert(stream_id.clone(), hashmap);
-            guard.insert(key, StorageValue::new(RespValue::Stream(map), None));
         }
     }
 
+    if let Some(sender) = channels.write().await.get_mut(&key).and_then(|reg| reg.pop_waiter()) {
+        sender.send(args[1].clone()).await.ok();
+    }
+
     RespValue::BulkString(format!("{}-{}", stream_id.milliseconds.unwrap(), stream_id.sequence.unwrap()).into())
+}
+
+fn build_entries_vec<'a>(range: impl Iterator<Item = (&'a StreamId, &'a HashMap<RespKey, RespValue>)>) -> VecDeque<RespValue> {
+    let mut entries_vec = VecDeque::new();
+    for (sid, hashmap) in range {
+        let mut inner_vec = VecDeque::new();
+        for entry in hashmap {
+            inner_vec.push_back(RespValue::from(entry.0.clone()));
+            inner_vec.push_back(entry.1.clone());
+        }
+        let mut entry_vec = VecDeque::new();
+        entry_vec.push_back(RespValue::BulkString(sid.to_string().into_bytes()));
+        entry_vec.push_back(RespValue::Array(inner_vec));
+        entries_vec.push_back(RespValue::Array(entry_vec));
+    }
+    entries_vec
 }
 
 async fn handle_xrange_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
@@ -457,25 +483,9 @@ async fn handle_xrange_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue
 
     match value_opt {
         Some(RespValue::Stream(map)) => {
-            let range = map.range(start_id..=end_id);
-            let mut ret_vec = VecDeque::new();
-            for (sid, hashmap) in range {
-                let mut inner_vec = VecDeque::new();
-                for entry in hashmap {
-                    inner_vec.push_back(RespValue::from(entry.0.clone()));
-                    inner_vec.push_back(entry.1.clone());
-                }
-
-                let mut entry_vec = VecDeque::new();
-                entry_vec.push_back(RespValue::BulkString(sid.to_string().into_bytes()));
-                entry_vec.push_back(RespValue::Array(inner_vec));
-
-                ret_vec.push_back(RespValue::Array(entry_vec));
-            }
-
-            RespValue::Array(ret_vec)
+            RespValue::Array(build_entries_vec(map.range(start_id..=end_id)))
         }
-        Some(_) => panic!("XRANGE: key exists but is not an array"),
+        Some(_) => panic!("XRANGE: key exists but is not a stream"),
         None => {
             storage.write().await.remove(&key);
             RespValue::Array(VecDeque::new())
@@ -483,9 +493,39 @@ async fn handle_xrange_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue
     }
 }
 
-async fn handle_xread_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
-    let key_start_idx = 2;
-    let n_keys = (args.len() - 2) / 2;
+async fn handle_xread_cmd(args: &Vec<RespValue>, storage: Storage, channels: Channels) -> RespValue {
+    let xread_type = parse_str_from_bulk_str(&args[1]);
+
+    let mut n_init_args = 2;
+    if xread_type.eq("block") {
+        n_init_args = 4;
+        let timeout_ms = parse_int_from_bulk_str(&args[2]) as u64;
+        let key = RespKey::from(args[4].clone());
+
+        let (tx, mut rx) = mpsc::channel(1);
+
+        channels.write().await
+            .entry(key)
+            .or_insert_with(|| WaiterRegistry { senders: VecDeque::new() })
+            .add_waiter(tx);
+
+        /* Block and wait for notification from XADD. */
+        if timeout_ms == 0 {
+            if let None = rx.recv().await {
+                return RespValue::NullArray
+            }
+        } else {
+            match timeout(Duration::from_millis(timeout_ms), rx.recv()).await {
+                Ok(Some(_)) => {},
+                Ok(None) | Err(_) => {
+                    return RespValue::NullArray
+                }
+            }
+        }
+    }
+
+    let key_start_idx = n_init_args;
+    let n_keys = (args.len() - n_init_args) / 2;
     let id_start_idx = key_start_idx + n_keys;
 
     let mut streams_vec = VecDeque::new();
@@ -498,28 +538,13 @@ async fn handle_xread_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue 
 
         match value_opt {
             Some(RespValue::Stream(map)) => {
-                let range = map.range((Excluded(&id), Unbounded));
+                let entries = build_entries_vec(map.range((Excluded(&id), Unbounded)));
                 let mut stream_vec = VecDeque::new();
-                let mut entries_vec = VecDeque::new();
                 stream_vec.push_back(args[key_start_idx + i].clone());
-                for (sid, hashmap) in range {
-                    let mut inner_vec = VecDeque::new();
-                    for entry in hashmap {
-                        inner_vec.push_back(RespValue::from(entry.0.clone()));
-                        inner_vec.push_back(entry.1.clone());
-                    }
-
-                    let mut entry_vec = VecDeque::new();
-                    entry_vec.push_back(RespValue::BulkString(sid.to_string().into_bytes()));
-                    entry_vec.push_back(RespValue::Array(inner_vec));
-
-                    entries_vec.push_back(RespValue::Array(entry_vec));
-                }
-
-                stream_vec.push_back(RespValue::Array(entries_vec));
+                stream_vec.push_back(RespValue::Array(entries));
                 streams_vec.push_back(RespValue::Array(stream_vec));
             }
-            Some(_) => panic!("XRANGE: key exists but is not an array"),
+            Some(_) => panic!("XREAD: key exists but is not a stream"),
             None => {
                 storage.write().await.remove(&key);
                 streams_vec.push_back(RespValue::Array(VecDeque::new()));
@@ -536,7 +561,6 @@ async fn handle_connection(mut stream: TcpStream, storage: Storage, channels: Ch
        let _ = match stream.read(&mut buf).await {
            Ok(0) => return Ok(()),
            Ok(n) => {
-               eprintln!("Received data in socket!");
                n
            }
            Err(e) => {
@@ -563,7 +587,7 @@ async fn handle_connection(mut stream: TcpStream, storage: Storage, channels: Ch
                        } else if cmd == b"RPUSH" {
                            response = handle_rpush_cmd(&arr, storage.clone(), channels.clone()).await;
                        } else if cmd == b"LPUSH" {
-                           response = handle_lpush_cmd(&arr, storage.clone(), channels.clone()).await;
+                           response = handle_lpush_cmd(&arr, storage.clone()).await;
                        } else if cmd == b"LPOP" {
                            response = handle_lpop_cmd(&arr, storage.clone()).await;
                        } else if cmd == b"BLPOP" {
@@ -575,11 +599,11 @@ async fn handle_connection(mut stream: TcpStream, storage: Storage, channels: Ch
                        } else if cmd == b"TYPE" {
                            response = handle_type_cmd(&arr, storage.clone()).await;
                        } else if cmd == b"XADD" {
-                           response = handle_xadd_cmd(&arr, storage.clone()).await;
+                           response = handle_xadd_cmd(&arr, storage.clone(), channels.clone()).await;
                        } else if cmd == b"XRANGE" {
                            response = handle_xrange_cmd(&arr, storage.clone()).await;
                        } else if cmd == b"XREAD" {
-                           response = handle_xread_cmd(&arr, storage.clone()).await;
+                           response = handle_xread_cmd(&arr, storage.clone(), channels.clone()).await;
                        } else {
                            panic!("Received unsupported command")
                        }
@@ -602,9 +626,7 @@ async fn main() -> Result<()> {
 
     let listener = TcpListener::bind("127.0.0.1:6379").await?;
     loop {
-        eprintln!("Waiting for new client...");
         let socket = listener.accept().await?.0;
-        eprintln!("Accepted a client!");
 
         let storage_clone = Arc::clone(&storage);
         let channels_clone = Arc::clone(&channels);
