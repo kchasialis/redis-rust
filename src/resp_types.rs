@@ -40,7 +40,7 @@ impl From<RespValue> for StreamId {
         match val {
             RespValue::BulkString(v) => {
                 let v_str = String::from_utf8(v).unwrap();
-                if v_str.eq("*") {
+                if v_str.eq("*") || v_str.eq("-") || v_str.eq("+") {
                     return StreamId {
                         milliseconds: None,
                         sequence: None

@@ -440,9 +440,15 @@ async fn handle_xrange_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue
 
     if start_id.sequence.is_none() {
         start_id.sequence = Some(0);
+        if start_id.milliseconds.is_none() {
+            start_id.milliseconds = Some(0);
+        }
     }
     if end_id.sequence.is_none() {
         end_id.sequence = Some(u64::MAX);
+        if end_id.milliseconds.is_none() {
+            end_id.milliseconds = Some(u64::MAX);
+        }
     }
 
     let value_opt = storage.read().await.get(&key)
