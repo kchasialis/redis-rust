@@ -9,21 +9,6 @@ A Redis-compatible server implemented from scratch in Rust. The server uses the 
 - **Inter-task communication** — Blocking commands (`BLPOP`, blocking `XREAD`) use Tokio `mpsc` channels. A per-key queue is used for senders so that the first writer wakes the first waiter in FIFO order.
 - **RESP parser** — A hand-written RESP v2/v3 parser handles all wire-format encoding and decoding.
 
-```
-┌─────────────┐     TCP      ┌──────────────────────┐
-│  Redis CLI  │ ──────────▶  │  TcpListener (6379)  │
-└─────────────┘              └──────────┬───────────┘
-                                        │  tokio::spawn per connection
-                             ┌──────────▼───────────┐
-                             │   handle_connection   │
-                             │   (async task)        │
-                             └──────────┬────────────┘
-                                        │
-                        ┌───────────────▼────────────────┐
-                        │  Arc<RwLock<HashMap>>  (Storage)│
-                        └────────────────────────────────┘
-```
-
 ## Supported Commands
 
 ### General
@@ -76,10 +61,10 @@ A Redis-compatible server implemented from scratch in Rust. The server uses the 
 ### Build & Run
 
 ```bash
-git clone https://github.com/<your-username>/redis-rust.git
+git clone https://github.com/kchasialis/redis-rust.git
 cd redis-rust
 cargo build --release
-./target/release/codecrafters-redis
+./target/release/redis-rs
 ```
 
 The server listens on `127.0.0.1:6379`.
