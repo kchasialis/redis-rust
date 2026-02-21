@@ -25,4 +25,4 @@ impl WaiterRegistry {
     }
 }
 
-pub(crate) type Channels = Arc<RwLock<HashMap<RespKey, WaiterRegistry>>>;
+pub type Channels = Arc<RwLock<HashMap<RespKey, WaiterRegistry>>>;

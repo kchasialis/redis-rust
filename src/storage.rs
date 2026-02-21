@@ -51,5 +51,5 @@ impl StorageValue {
     }
 }
 
-pub(crate) type Storage = Arc<RwLock<HashMap<RespKey, StorageValue>>>;
+pub type Storage = Arc<RwLock<HashMap<RespKey, StorageValue>>>;
 
