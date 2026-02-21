@@ -562,6 +562,38 @@ async fn handle_xread_cmd(args: &Vec<RespValue>, storage: Storage, channels: Cha
     RespValue::Array(streams_vec)
 }
 
+async fn handle_incr_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
+    let key = RespKey::from(args[1].clone());
+    let mut guard = storage.write().await;
+
+    let current_val: i64 = match guard.get(&key) {
+        Some(storage_val) => {
+            match storage_val.data() {
+                Some(RespValue::BulkString(v)) => {
+                    match std::str::from_utf8(v).ok().and_then(|s| s.parse::<i64>().ok()) {
+                        Some(n) => n,
+                        None => return RespValue::SimpleError(
+                            "ERR value is not an integer or out of range".to_string()
+                        ),
+                    }
+                }
+                Some(_) => return RespValue::SimpleError(
+                    "ERR value is not an integer or out of range".to_string()
+                ),
+                None => 0,
+            }
+        }
+        None => 0,
+    };
+
+    let new_val = current_val + 1;
+    guard.insert(key, StorageValue::new(
+        RespValue::BulkString(new_val.to_string().into_bytes()),
+        None,
+    ));
+    RespValue::Integer(new_val)
+}
+
 async fn handle_connection(mut stream: TcpStream, storage: Storage, channels: Channels) -> Result<()> {
    let mut buf = [0u8; 1024];
    loop {
@@ -611,6 +643,8 @@ async fn handle_connection(mut stream: TcpStream, storage: Storage, channels: Ch
                            response = handle_xrange_cmd(&arr, storage.clone()).await;
                        } else if cmd == b"XREAD" {
                            response = handle_xread_cmd(&arr, storage.clone(), channels.clone()).await;
+                       } else if cmd == b"INCR" {
+                           response = handle_incr_cmd(&arr, storage.clone()).await;
                        } else {
                            panic!("Received unsupported command")
                        }
