@@ -13,7 +13,7 @@ use std::io::Result;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::resp_types::{RespKey, RespValue, StreamId};
 use crate::resp_types::RespKey::{BulkString, SimpleString};
-use crate::storage::StorageValue;
+use crate::storage::{StorageValue};
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound::{Excluded, Unbounded};
 use std::sync::Arc;
@@ -594,8 +594,19 @@ async fn handle_incr_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
     RespValue::Integer(new_val)
 }
 
+async fn handle_multi_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
+    RespValue::SimpleString("OK".to_string())
+}
+
+async fn handle_exec_cmd(args: &Vec<RespValue>, storage: Storage, command_queue: &mut VecDeque<Vec<RespValue>>) -> RespValue {
+    RespValue::SimpleString("OK".to_string())
+}
+
 async fn handle_connection(mut stream: TcpStream, storage: Storage, channels: Channels) -> Result<()> {
-   let mut buf = [0u8; 1024];
+    let mut in_transaction = false;
+    let mut command_queue: VecDeque<Vec<RespValue>> = VecDeque::new();
+
+    let mut buf = [0u8; 1024];
    loop {
        let _ = match stream.read(&mut buf).await {
            Ok(0) => return Ok(()),
@@ -614,6 +625,12 @@ async fn handle_connection(mut stream: TcpStream, storage: Storage, channels: Ch
                let arr: Vec<RespValue> = deque.iter().cloned().collect();
                match &arr[0] {
                    RespValue::BulkString(cmd) => {
+                       if in_transaction {
+                           command_queue.push_back(arr.clone());
+                           stream.write_all(b"+QUEUED\r\n").await?;
+                           continue;
+                       }
+
                        let response;
                        if cmd == b"PING" {
                            response = handle_ping_cmd();
@@ -645,6 +662,12 @@ async fn handle_connection(mut stream: TcpStream, storage: Storage, channels: Ch
                            response = handle_xread_cmd(&arr, storage.clone(), channels.clone()).await;
                        } else if cmd == b"INCR" {
                            response = handle_incr_cmd(&arr, storage.clone()).await;
+                       } else if cmd == b"MULTI" {
+                           in_transaction = true;
+                           response = handle_multi_cmd(&arr, storage.clone()).await;
+                       } else if cmd == b"EXEC" {
+                           in_transaction = false;
+                           response = handle_exec_cmd(&arr, storage.clone(), &mut command_queue).await;
                        } else {
                            panic!("Received unsupported command")
                        }
