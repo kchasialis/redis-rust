@@ -666,8 +666,12 @@ async fn handle_connection(mut stream: TcpStream, storage: Storage, channels: Ch
                            in_transaction = true;
                            response = handle_multi_cmd(&arr, storage.clone()).await;
                        } else if cmd == b"EXEC" {
-                           in_transaction = false;
-                           response = handle_exec_cmd(&arr, storage.clone(), &mut command_queue).await;
+                           if !in_transaction {
+                               response = RespValue::SimpleError("ERR EXEC without MULTI".to_string());
+                           } else {
+                               in_transaction = false;
+                               response = handle_exec_cmd(&arr, storage.clone(), &mut command_queue).await;
+                           }
                        } else {
                            panic!("Received unsupported command")
                        }
