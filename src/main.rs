@@ -599,7 +599,7 @@ async fn handle_multi_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue 
 }
 
 async fn handle_exec_cmd(args: &Vec<RespValue>, storage: Storage, command_queue: &mut VecDeque<Vec<RespValue>>) -> RespValue {
-    RespValue::SimpleString("OK".to_string())
+    RespValue::Array(VecDeque::new())
 }
 
 async fn handle_connection(mut stream: TcpStream, storage: Storage, channels: Channels) -> Result<()> {
@@ -625,7 +625,7 @@ async fn handle_connection(mut stream: TcpStream, storage: Storage, channels: Ch
                let arr: Vec<RespValue> = deque.iter().cloned().collect();
                match &arr[0] {
                    RespValue::BulkString(cmd) => {
-                       if in_transaction {
+                       if in_transaction && cmd != b"EXEC" {
                            command_queue.push_back(arr.clone());
                            stream.write_all(b"+QUEUED\r\n").await?;
                            continue;
