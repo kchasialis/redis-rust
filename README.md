@@ -24,6 +24,7 @@ A Redis-compatible server implemented from scratch in Rust. The server uses the 
 |---------|--------|-------------|
 | `SET` | `SET <key> <value> [EX seconds \| PX milliseconds]` | Set a key with optional TTL |
 | `GET` | `GET <key>` | Get the value of a key |
+| `INCR` | `INCR <key>` | Atomically increment an integer value by 1 |
 | `TYPE` | `TYPE <key>` | Returns the type of the value stored (`string`, `stream`, `none`) |
 
 ### Lists
@@ -45,11 +46,22 @@ A Redis-compatible server implemented from scratch in Rust. The server uses the 
 | `XRANGE` | `XRANGE <key> <start> <end>` | Return entries in an ID range (`-` = min, `+` = max) |
 | `XREAD` | `XREAD [BLOCK <ms>] STREAMS <key> [key ...] <id> [id ...]` | Read new entries from one or more streams. Use `$` as ID to read only new entries |
 
+### Transactions
+
+| Command | Syntax | Description |
+|---------|--------|-------------|
+| `MULTI` | `MULTI` | Begin a transaction block |
+| `EXEC` | `EXEC` | Execute all commands queued since `MULTI` |
+| `DISCARD` | `DISCARD` | Abort the transaction and discard the command queue |
+
+Commands issued after `MULTI` are queued and return `QUEUED`. They are executed atomically when `EXEC` is called. `DISCARD` clears the queue and exits the transaction block.
+
 ## Key Implementation Details
 
 - **Stream IDs** are monotonically ordered `(milliseconds, sequence)` pairs stored in a `BTreeMap` for efficient range queries.
 - **TTL** is implemented lazily: expiry is checked on read rather than via a background sweeper.
 - **Blocking operations** (`BLPOP`, `XREAD BLOCK`) register a Tokio `mpsc::Sender` in a per-key registry. The writing command pops the first waiter and sends the data directly through the channel, avoiding a second storage lookup where possible.
+- **Transactions** are tracked per-connection. A command queue is maintained for each client in `MULTI` state and flushed on `EXEC`.
 - **RESP protocol** — Full RESP v2 support plus v3 types (Boolean, Double, BigNumber, BulkError, Map, Set, VerbatimString).
 
 ### Build & Run
@@ -69,16 +81,21 @@ The server listens on `127.0.0.1:6379`.
 redis-cli ping
 redis-cli set foo bar EX 60
 redis-cli get foo
+redis-cli incr counter
 redis-cli rpush mylist a b c
 redis-cli blpop mylist 5
 redis-cli xadd mystream '*' name Alice age 30
 redis-cli xrange mystream - +
 redis-cli xread block 0 streams mystream $
+redis-cli multi
+redis-cli set foo 1
+redis-cli incr foo
+redis-cli exec
 ```
 
 ## Testing
 
-Several tests can be found under `tests` directory. 
+Several tests can be found under `tests` directory.
 
 | Module | Tests |
 |---|---|
