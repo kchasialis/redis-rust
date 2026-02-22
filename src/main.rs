@@ -594,12 +594,60 @@ async fn handle_incr_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
     RespValue::Integer(new_val)
 }
 
-async fn handle_multi_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
-    RespValue::SimpleString("OK".to_string())
+async fn handle_exec_cmd(storage: Storage, channels: Channels, command_queue: &mut VecDeque<Vec<RespValue>>) -> RespValue {
+    let mut result_vec = VecDeque::new();
+
+    for command in command_queue.iter() {
+        let resp = handle_cmd(command, storage.clone(), channels.clone()).await;
+        result_vec.push_back(resp);
+    }
+
+    command_queue.clear();
+    RespValue::Array(result_vec)
 }
 
-async fn handle_exec_cmd(args: &Vec<RespValue>, storage: Storage, command_queue: &mut VecDeque<Vec<RespValue>>) -> RespValue {
-    RespValue::Array(VecDeque::new())
+async fn handle_cmd(arr: &Vec<RespValue>, storage: Storage, channels: Channels) -> RespValue {
+    match &arr[0] {
+        RespValue::BulkString(cmd) => {
+            if cmd == b"PING" {
+                handle_ping_cmd()
+            } else if cmd == b"ECHO" {
+                handle_echo_cmd(arr)
+            } else if cmd == b"SET" {
+                handle_set_cmd(arr, storage).await
+            } else if cmd == b"GET" {
+                handle_get_cmd(arr, storage).await
+            } else if cmd == b"RPUSH" {
+                handle_rpush_cmd(arr, storage, channels).await
+            } else if cmd == b"LPUSH" {
+                handle_lpush_cmd(arr, storage).await
+            } else if cmd == b"LPOP" {
+                handle_lpop_cmd(arr, storage).await
+            } else if cmd == b"BLPOP" {
+                handle_blpop_cmd(arr, storage, channels).await
+            } else if cmd == b"LRANGE" {
+                handle_lrange_cmd(arr, storage).await
+            } else if cmd == b"LLEN" {
+                handle_llen_cmd(arr, storage).await
+            } else if cmd == b"TYPE" {
+                handle_type_cmd(arr, storage).await
+            } else if cmd == b"XADD" {
+                handle_xadd_cmd(arr, storage, channels).await
+            } else if cmd == b"XRANGE" {
+                handle_xrange_cmd(arr, storage).await
+            } else if cmd == b"XREAD" {
+                handle_xread_cmd(arr, storage, channels).await
+            } else if cmd == b"INCR" {
+                handle_incr_cmd(arr, storage).await
+            } else {
+                RespValue::SimpleError(format!(
+                    "ERR unknown command '{}'",
+                    String::from_utf8_lossy(cmd)
+                ))
+            }
+        }
+        _ => panic!("Expected bulk string as first element in command array"),
+    }
 }
 
 async fn handle_connection(mut stream: TcpStream, storage: Storage, channels: Channels) -> Result<()> {
@@ -607,82 +655,53 @@ async fn handle_connection(mut stream: TcpStream, storage: Storage, channels: Ch
     let mut command_queue: VecDeque<Vec<RespValue>> = VecDeque::new();
 
     let mut buf = [0u8; 1024];
-   loop {
-       let _ = match stream.read(&mut buf).await {
-           Ok(0) => return Ok(()),
-           Ok(n) => {
-               n
-           }
-           Err(e) => {
-               eprintln!("failed to read from socket; err = {:?}", e);
-               return Ok(())
-           }
-       };
+    loop {
+        match stream.read(&mut buf).await {
+            Ok(0) => return Ok(()),
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("failed to read from socket; err = {:?}", e);
+                return Ok(());
+            }
+        };
 
-       let val = RespValue::deserialize(&buf).unwrap();
-       match &val {
-           RespValue::Array(deque) => {
-               let arr: Vec<RespValue> = deque.iter().cloned().collect();
-               match &arr[0] {
-                   RespValue::BulkString(cmd) => {
-                       if in_transaction && cmd != b"EXEC" {
-                           command_queue.push_back(arr.clone());
-                           stream.write_all(b"+QUEUED\r\n").await?;
-                           continue;
-                       }
+        let val = RespValue::deserialize(&buf).unwrap();
+        let RespValue::Array(deque) = &val else {
+            panic!("Expected array type for command");
+        };
 
-                       let response;
-                       if cmd == b"PING" {
-                           response = handle_ping_cmd();
-                       } else if cmd == b"ECHO" {
-                           response = handle_echo_cmd(&arr);
-                       } else if cmd == b"SET" {
-                           response = handle_set_cmd(&arr, storage.clone()).await;
-                       } else if cmd == b"GET" {
-                           response = handle_get_cmd(&arr, storage.clone()).await;
-                       } else if cmd == b"RPUSH" {
-                           response = handle_rpush_cmd(&arr, storage.clone(), channels.clone()).await;
-                       } else if cmd == b"LPUSH" {
-                           response = handle_lpush_cmd(&arr, storage.clone()).await;
-                       } else if cmd == b"LPOP" {
-                           response = handle_lpop_cmd(&arr, storage.clone()).await;
-                       } else if cmd == b"BLPOP" {
-                           response = handle_blpop_cmd(&arr, storage.clone(), channels.clone()).await;
-                       } else if cmd == b"LRANGE" {
-                           response = handle_lrange_cmd(&arr, storage.clone()).await;
-                       } else if cmd == b"LLEN" {
-                           response = handle_llen_cmd(&arr, storage.clone()).await;
-                       } else if cmd == b"TYPE" {
-                           response = handle_type_cmd(&arr, storage.clone()).await;
-                       } else if cmd == b"XADD" {
-                           response = handle_xadd_cmd(&arr, storage.clone(), channels.clone()).await;
-                       } else if cmd == b"XRANGE" {
-                           response = handle_xrange_cmd(&arr, storage.clone()).await;
-                       } else if cmd == b"XREAD" {
-                           response = handle_xread_cmd(&arr, storage.clone(), channels.clone()).await;
-                       } else if cmd == b"INCR" {
-                           response = handle_incr_cmd(&arr, storage.clone()).await;
-                       } else if cmd == b"MULTI" {
-                           in_transaction = true;
-                           response = handle_multi_cmd(&arr, storage.clone()).await;
-                       } else if cmd == b"EXEC" {
-                           if !in_transaction {
-                               response = RespValue::SimpleError("ERR EXEC without MULTI".to_string());
-                           } else {
-                               in_transaction = false;
-                               response = handle_exec_cmd(&arr, storage.clone(), &mut command_queue).await;
-                           }
-                       } else {
-                           panic!("Received unsupported command")
-                       }
-                       stream.write_all(response.serialize().as_slice()).await?;
-                   }
-                   _ => panic!("Expected bulk string as array element in command")
-               }
-           }
-           _ => panic!("Expected array type for command")
-       }
-   }
+        let arr: Vec<RespValue> = deque.iter().cloned().collect();
+        let RespValue::BulkString(cmd) = &arr[0] else {
+            panic!("Expected bulk string as array element in command");
+        };
+
+        let response = if cmd == b"MULTI" {
+            in_transaction = true;
+            RespValue::SimpleString("OK".to_string())
+        } else if cmd == b"EXEC" {
+            if !in_transaction {
+                RespValue::SimpleError("ERR EXEC without MULTI".to_string())
+            } else {
+                in_transaction = false;
+                handle_exec_cmd(storage.clone(), channels.clone(), &mut command_queue).await
+            }
+        } else if cmd == b"DISCARD" {
+            if !in_transaction {
+                RespValue::SimpleError("ERR DISCARD without MULTI".to_string())
+            } else {
+                in_transaction = false;
+                command_queue.clear();
+                RespValue::SimpleString("OK".to_string())
+            }
+        } else if in_transaction {
+            command_queue.push_back(arr.clone());
+            RespValue::SimpleString("QUEUED".to_string())
+        } else {
+            handle_cmd(&arr, storage.clone(), channels.clone()).await
+        };
+
+        stream.write_all(response.serialize().as_slice()).await?;
+    }
 }
 
 #[tokio::main]
