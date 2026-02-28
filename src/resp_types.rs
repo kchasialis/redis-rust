@@ -1,11 +1,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::{Debug, Display, Formatter};
 use std::str::FromStr;
-use std::string::ParseError;
 use ordered_float::OrderedFloat;
 use crate::resp_types::RespValue::NullArray;
 use std::collections::VecDeque;
-use std::cmp::Ordering;
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -200,7 +198,7 @@ impl RespValue {
             RespValue::Null => {
                 buf.extend_from_slice(b"_\r\n");
             }
-            RespValue::NullArray => {
+            NullArray => {
                 buf.extend_from_slice(b"*-1\r\n");
             }
             RespValue::NullBulkString => {
@@ -298,7 +296,7 @@ impl ParserError {
 }
 
 impl Debug for ParserError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             ParserError::Error(str) => write!(f, "Failed to parse input: {}", str)
         }
@@ -306,7 +304,7 @@ impl Debug for ParserError {
 }
 
 impl Display for ParserError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             ParserError::Error(msg) => write!(f, "Failed to parse input: {}", msg)
         }
@@ -442,7 +440,7 @@ fn parse_bulk_error(input: &[u8]) -> Result<(RespValue, &[u8])> {
         _ => Err(ParserError::new("Failed to extract simple error from simple string"))
     }
 }
-fn parse_verbatim_str(input: &[u8]) -> Result<(RespValue, &[u8])> {
+fn parse_verbatim_str(_: &[u8]) -> Result<(RespValue, &[u8])> {
     Err(ParserError::new("Verbatim string type not supported yet!"))
 }
 
@@ -484,11 +482,11 @@ fn parse_set(input: &[u8]) -> Result<(RespValue, &[u8])> {
         _ => Err(ParserError::new("Failed to parse set"))
     }
 }
-fn parse_push(input: &[u8]) -> Result<(RespValue, &[u8])> {
+fn parse_push(_: &[u8]) -> Result<(RespValue, &[u8])> {
     Err(ParserError::new("Push type supported yet!"))
 }
 
-fn parse_resp_bytes(input: &[u8]) -> Result<(RespValue, &[u8])> {
+pub fn parse_resp_bytes(input: &[u8]) -> Result<(RespValue, &[u8])> {
     match input[0] {
         b'+' => {
             parse_simple_str(input)

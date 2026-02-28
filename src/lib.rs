@@ -1,30 +1,36 @@
-#![allow(unused_imports)]
-
 pub mod resp_types;
 pub mod storage;
 pub mod task_communication;
+pub mod replication;
 
 use storage::Storage;
 
-use std::io::{Read, Write};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use std::io::Result;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use crate::resp_types::{RespKey, RespValue, StreamId};
-use crate::resp_types::RespKey::{BulkString, SimpleString};
+use crate::resp_types::{parse_resp_bytes, RespKey, RespValue, StreamId};
 use crate::storage::StorageValue;
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound::{Excluded, Unbounded};
-use std::sync::Arc;
-use tokio::sync::RwLock;
 use tokio::sync::mpsc;
 use std::collections::VecDeque;
-use std::fmt::Debug;
-use std::time;
+use clap::Parser;
 use tokio::time::timeout;
-use std::ops::Bound;
+use crate::replication::{NodeRole, ReplicaConnection, ReplicaInfo, ReplicationStateHandle};
 use crate::task_communication::{Channels, WaiterRegistry};
+
+#[derive(Parser, Debug)]
+#[command(name = "redis-server", about = "A Redis-like server")]
+pub struct Args {
+    #[arg(long, default_value = "127.0.0.1")]
+    pub host: String,
+
+    #[arg(long, default_value_t = 6379)]
+    pub port: u16,
+
+    #[arg(long)]
+    pub replicaof: Option<String>
+}
 
 pub fn handle_ping_cmd() -> RespValue {
     eprintln!("Received PING command");
@@ -36,7 +42,7 @@ pub fn handle_echo_cmd(args: &Vec<RespValue>) -> RespValue {
     args[1].clone()
 }
 
-pub fn parse_int_from_bulk_str(resp_val: &RespValue) -> i64 {
+fn parse_int_from_bulk_str(resp_val: &RespValue) -> i64 {
     match resp_val {
         RespValue::BulkString(v) => {
             std::str::from_utf8(v)
@@ -48,7 +54,7 @@ pub fn parse_int_from_bulk_str(resp_val: &RespValue) -> i64 {
     }
 }
 
-pub fn parse_float_from_bulk_str(resp_val: &RespValue) -> f64 {
+fn parse_float_from_bulk_str(resp_val: &RespValue) -> f64 {
     match resp_val {
         RespValue::BulkString(v) => {
             std::str::from_utf8(v)
@@ -60,7 +66,7 @@ pub fn parse_float_from_bulk_str(resp_val: &RespValue) -> f64 {
     }
 }
 
-pub fn parse_str_from_bulk_str(resp_val: &RespValue) -> String {
+fn parse_str_from_bulk_str(resp_val: &RespValue) -> String {
     match resp_val {
         RespValue::BulkString(v) => {
             std::str::from_utf8(v).unwrap().to_lowercase()
@@ -69,7 +75,7 @@ pub fn parse_str_from_bulk_str(resp_val: &RespValue) -> String {
     }
 }
 
-pub async fn handle_set_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValue {
+pub async fn handle_set_cmd(args: &Vec<RespValue>, storage: Storage, repl_state: ReplicationStateHandle) -> RespValue {
     let mut expiry_duration: Option<Duration> = None;
     if args.len() == 5 {
         let expiry_type = match &args[3] {
@@ -89,6 +95,24 @@ pub async fn handle_set_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValu
 
     storage.write().await.insert(args[1].clone().into(),
                                  StorageValue::new(args[2].clone(), expiry_duration));
+
+    let mut state = repl_state.write().await;
+    match state.role {
+        NodeRole::Master { replicas: ref mut replicas_write } => {
+            let mut resp_vec = VecDeque::new();
+            for arg in args {
+                resp_vec.push_back(arg.clone());
+            }
+            let cmd_bytes = RespValue::Array(resp_vec).serialize();
+            for conn in replicas_write {
+                conn.write.write_all(cmd_bytes.clone().as_slice()).await.expect("Failed to send SET to replica");
+            }
+
+            state.repl_offset += cmd_bytes.len() as u64;
+        }
+        NodeRole::Replica { info: _ } => {}
+    }
+
     RespValue::SimpleString("OK".to_string())
 }
 
@@ -110,41 +134,43 @@ pub async fn handle_get_cmd(args: &Vec<RespValue>, storage: Storage) -> RespValu
 pub async fn handle_rpush_cmd(args: &Vec<RespValue>, storage: Storage, channels: Channels) -> RespValue {
     let key = RespKey::from(args[1].clone());
 
-    let mut guard = storage.write().await;
-
-    let list_len = match guard.get_mut(&key) {
-        Some(storage_val) => {
-            match storage_val.data_mut() {
-                Some(RespValue::Array(vec)) => {
-                    for arg in &args[2..] {
-                        vec.push_back(arg.clone());
+    let list_len = {
+        let mut guard = storage.write().await;
+        match guard.get_mut(&key) {
+            Some(storage_val) => {
+                match storage_val.data_mut() {
+                    Some(RespValue::Array(vec)) => {
+                        for arg in &args[2..] {
+                            vec.push_back(arg.clone());
+                        }
+                        vec.len()
                     }
-                    vec.len()
-                }
-                Some(_) => panic!("RPUSH: key exists but is not an array"),
-                None => {
-                    let mut list = VecDeque::new();
-                    for arg in &args[2..] {
-                        list.push_back(arg.clone());
+                    Some(_) => panic!("RPUSH: key exists but is not an array"),
+                    None => {
+                        let mut list = VecDeque::new();
+                        for arg in &args[2..] {
+                            list.push_back(arg.clone());
+                        }
+                        let len = list.len();
+                        *storage_val = StorageValue::new(RespValue::Array(list), None);
+                        len
                     }
-                    let len = list.len();
-                    *storage_val = StorageValue::new(RespValue::Array(list), None);
-                    len
                 }
             }
-        }
-        None => {
-            let mut list = VecDeque::new();
-            for arg in &args[2..] {
-                list.push_back(arg.clone());
+            None => {
+                let mut list = VecDeque::new();
+                for arg in &args[2..] {
+                    list.push_back(arg.clone());
+                }
+                let len = list.len();
+                guard.insert(key.clone(), StorageValue::new(RespValue::Array(list), None));
+                len
             }
-            let len = list.len();
-            guard.insert(key.clone(), StorageValue::new(RespValue::Array(list), None));
-            len
         }
     };
 
     if let Some(sender) = channels.write().await.get_mut(&key).and_then(|reg| reg.pop_waiter()) {
+        let mut guard = storage.write().await;
         if let Some(storage_val) = guard.get_mut(&key) {
             if let Some(RespValue::Array(vec)) = storage_val.data_mut() {
                 if let Some(popped) = vec.pop_front() {
@@ -594,11 +620,57 @@ pub async fn handle_incr_cmd(args: &Vec<RespValue>, storage: Storage) -> RespVal
     RespValue::Integer(new_val)
 }
 
-pub async fn handle_exec_cmd(storage: Storage, channels: Channels, command_queue: &mut VecDeque<Vec<RespValue>>) -> RespValue {
+pub async fn handle_info_cmd(_args: &Vec<RespValue>, _storage: Storage, repl_state: ReplicationStateHandle) -> RespValue {
+    let guard = repl_state.read().await;
+
+    let result = match guard.role {
+        NodeRole::Master { replicas: _ } => {
+            format!("role:master\nmaster_replid:{}\nmaster_repl_offset:{}", guard.repl_id, guard.repl_offset).into_bytes()
+        }
+        NodeRole::Replica { info: _ } => {
+            format!("role:slave\nmaster_replid:{}\nmaster_repl_offset:{}", guard.repl_id, guard.repl_offset).into_bytes()
+        }
+    };
+
+    RespValue::BulkString(result)
+}
+
+pub async fn handle_replconf_cmd(args: &Vec<RespValue>, _storage: Storage, repl_state: ReplicationStateHandle) -> RespValue {
+    let arg = parse_str_from_bulk_str(&args[1]);
+
+    if arg.eq("getack") {
+        let mut result_vec = VecDeque::new();
+        result_vec.push_back(RespValue::BulkString(b"REPLCONF".to_vec()));
+        result_vec.push_back(RespValue::BulkString(b"ACK".to_vec()));
+        let offset = repl_state.read().await.repl_offset;
+        result_vec.push_back(RespValue::BulkString(offset.to_string().into_bytes()));
+
+        RespValue::Array(result_vec)
+    } else {
+        RespValue::SimpleString("OK".to_string())
+    }
+}
+
+pub async fn handle_psync_cmd(_args: &Vec<RespValue>, _storage: Storage, repl_state: ReplicationStateHandle) -> RespValue {
+    let guard = repl_state.read().await;
+
+    let result = match guard.role {
+        NodeRole::Master { replicas: _ } => {
+            format!("FULLRESYNC {} {}", guard.repl_id, guard.repl_offset)
+        }
+        NodeRole::Replica { info: _ } => {
+            panic!("Replica should not receive psync command")
+        }
+    };
+
+    RespValue::SimpleString(result)
+}
+
+pub async fn handle_exec_cmd(storage: Storage, channels: Channels, command_queue: &mut VecDeque<Vec<RespValue>>, repl_state: ReplicationStateHandle) -> RespValue {
     let mut result_vec = VecDeque::new();
 
     for command in command_queue.iter() {
-        let resp = handle_cmd(command, storage.clone(), channels.clone()).await;
+        let resp = handle_cmd(command, storage.clone(), channels.clone(), repl_state.clone()).await;
         result_vec.push_back(resp);
     }
 
@@ -606,7 +678,59 @@ pub async fn handle_exec_cmd(storage: Storage, channels: Channels, command_queue
     RespValue::Array(result_vec)
 }
 
-pub async fn handle_cmd(arr: &Vec<RespValue>, storage: Storage, channels: Channels) -> RespValue {
+pub async fn handle_wait_cmd(arr: &Vec<RespValue>, repl_state: ReplicationStateHandle) -> RespValue {
+    let timeout = parse_int_from_bulk_str(&arr[2]);
+
+    let replconf_cmd_bytes = RespValue::Array(VecDeque::from([
+        RespValue::BulkString(b"REPLCONF".to_vec()),
+        RespValue::BulkString(b"GETACK".to_vec()),
+        RespValue::BulkString(b"*".to_vec()),
+    ])).serialize();
+
+    let mut guard = repl_state.write().await;
+    let repl_offset = guard.repl_offset;
+
+    let n_replicas = match guard.role {
+        NodeRole::Master { ref mut replicas } => {
+            if repl_offset == 0 {
+                replicas.len()
+            } else {
+                for replica in replicas.iter_mut() {
+                    replica.write.write_all(replconf_cmd_bytes.as_slice()).await.expect("Failed to send REPLCONF to replica");
+                }
+
+                let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout as u64);
+
+                let mut n_replicas = 0;
+                for replica in replicas.iter_mut() {
+                    let mut buf = [0u8; 1024];
+                    match tokio::time::timeout_at(deadline, replica.read.read(&mut buf)).await {
+                        Ok(Ok(n)) if n > 0 => {
+                            let val = RespValue::deserialize(&buf).unwrap();
+                            let RespValue::Array(deque) = &val else {
+                                panic!("Expected array type for command");
+                            };
+                            let repl_offset = parse_int_from_bulk_str(deque.back().unwrap());
+                            if repl_offset >= repl_offset {
+                                n_replicas += 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                n_replicas as usize
+            }
+        },
+        NodeRole::Replica { .. } => {
+            panic!("Replicas should not receive this command")
+        }
+    };
+
+    RespValue::Integer(n_replicas as i64)
+}
+
+pub async fn handle_cmd(arr: &Vec<RespValue>, storage: Storage, channels: Channels, repl_state: ReplicationStateHandle) -> RespValue {
     match &arr[0] {
         RespValue::BulkString(cmd) => {
             if cmd == b"PING" {
@@ -614,7 +738,7 @@ pub async fn handle_cmd(arr: &Vec<RespValue>, storage: Storage, channels: Channe
             } else if cmd == b"ECHO" {
                 handle_echo_cmd(arr)
             } else if cmd == b"SET" {
-                handle_set_cmd(arr, storage).await
+                handle_set_cmd(arr, storage, repl_state).await
             } else if cmd == b"GET" {
                 handle_get_cmd(arr, storage).await
             } else if cmd == b"RPUSH" {
@@ -639,6 +763,14 @@ pub async fn handle_cmd(arr: &Vec<RespValue>, storage: Storage, channels: Channe
                 handle_xread_cmd(arr, storage, channels).await
             } else if cmd == b"INCR" {
                 handle_incr_cmd(arr, storage).await
+            } else if cmd == b"INFO" {
+                handle_info_cmd(arr, storage, repl_state).await
+            } else if cmd == b"REPLCONF" {
+                handle_replconf_cmd(arr, storage, repl_state).await
+            } else if cmd == b"PSYNC" {
+                handle_psync_cmd(arr, storage, repl_state).await
+            } else if cmd == b"WAIT" {
+                handle_wait_cmd(arr, repl_state).await
             } else {
                 RespValue::SimpleError(format!(
                     "ERR unknown command '{}'",
@@ -650,7 +782,7 @@ pub async fn handle_cmd(arr: &Vec<RespValue>, storage: Storage, channels: Channe
     }
 }
 
-pub async fn handle_connection(mut stream: TcpStream, storage: Storage, channels: Channels) -> Result<()> {
+pub async fn handle_connection(mut stream: TcpStream, storage: Storage, channels: Channels, repl_state: ReplicationStateHandle) -> std::io::Result<()> {
     let mut in_transaction = false;
     let mut command_queue: VecDeque<Vec<RespValue>> = VecDeque::new();
 
@@ -683,7 +815,7 @@ pub async fn handle_connection(mut stream: TcpStream, storage: Storage, channels
                 RespValue::SimpleError("ERR EXEC without MULTI".to_string())
             } else {
                 in_transaction = false;
-                handle_exec_cmd(storage.clone(), channels.clone(), &mut command_queue).await
+                handle_exec_cmd(storage.clone(), channels.clone(), &mut command_queue, repl_state.clone()).await
             }
         } else if cmd == b"DISCARD" {
             if !in_transaction {
@@ -697,9 +829,101 @@ pub async fn handle_connection(mut stream: TcpStream, storage: Storage, channels
             command_queue.push_back(arr.clone());
             RespValue::SimpleString("QUEUED".to_string())
         } else {
-            handle_cmd(&arr, storage.clone(), channels.clone()).await
+            handle_cmd(&arr, storage.clone(), channels.clone(), repl_state.clone()).await
         };
 
         stream.write_all(response.serialize().as_slice()).await?;
+
+        if cmd == b"PSYNC" {
+            let empty_rdb = hex::decode("524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2").unwrap();
+            let header = format!("${}\r\n", empty_rdb.len());
+            stream.write_all(header.as_bytes()).await?;
+            stream.write_all(&empty_rdb).await?;
+
+            let (read_half, write_half) = stream.into_split();
+            repl_state.write().await.add_replica(ReplicaConnection { write: write_half, read: read_half });
+            return Ok(());
+        }
+    }
+}
+
+pub async fn run_replication(replica_info: ReplicaInfo, port: u16, storage: Storage, channels: Channels, repl_state: ReplicationStateHandle) {
+    let mut stream = TcpStream::connect(format!("{}:{}", replica_info.m_host, replica_info.m_port))
+        .await
+        .expect("Failed to connect to master");
+
+    let commands: Vec<RespValue> = vec![
+        RespValue::Array(VecDeque::from([
+            RespValue::BulkString(b"PING".to_vec()),
+        ])),
+        RespValue::Array(VecDeque::from([
+            RespValue::BulkString(b"REPLCONF".to_vec()),
+            RespValue::BulkString(b"listening-port".to_vec()),
+            RespValue::BulkString(port.to_string().into_bytes()),
+        ])),
+        RespValue::Array(VecDeque::from([
+            RespValue::BulkString(b"REPLCONF".to_vec()),
+            RespValue::BulkString(b"capa".to_vec()),
+            RespValue::BulkString(b"psync2".to_vec()),
+        ])),
+        RespValue::Array(VecDeque::from([
+            RespValue::BulkString(b"PSYNC".to_vec()),
+            RespValue::BulkString(b"?".to_vec()),
+            RespValue::BulkString(b"-1".to_vec())
+        ]))
+    ];
+
+    let mut buf = [0u8; 512];
+    for cmd in &commands[..commands.len() - 1] {
+        stream.write_all(cmd.serialize().as_slice()).await.expect("Failed to send command");
+        let n = stream.read(&mut buf).await.expect("Failed to read response");
+        eprintln!("[repl] handshake response ({} bytes): {:?}", n, String::from_utf8_lossy(&buf[..n]));
+    }
+
+    stream.write_all(commands.last().unwrap().serialize().as_slice()).await.unwrap();
+    let mut n = stream.read(&mut buf).await.expect("Failed to read FULLRESYNC");
+
+    while buf[..n].iter().position(|&b| b == b'$').is_none() {
+        let more = stream.read(&mut buf[n..]).await.expect("Failed to read more");
+        n += more;
+    }
+    let rdb_start = buf[..n].iter().position(|&b| b == b'$').unwrap();
+    let header_end = rdb_start + buf[rdb_start..n].windows(2)
+        .position(|w| w == b"\r\n").unwrap() + 2;
+    let rdb_len: usize = std::str::from_utf8(&buf[rdb_start + 1..header_end - 2])
+        .unwrap().parse().unwrap();
+
+    let mut accumulator: Vec<u8> = buf[header_end + rdb_len..n].to_vec();
+    loop {
+        while !accumulator.is_empty() {
+            match parse_resp_bytes(&accumulator) {
+                Ok((val, remainder)) => {
+                    let remaining = remainder.to_vec();
+                    let bytes_consumed = (accumulator.len() - remainder.len()) as u64;
+                    let RespValue::Array(deque) = val else { panic!("Expected array"); };
+                    let arr: Vec<RespValue> = deque.iter().cloned().collect();
+                    let response = handle_cmd(&arr, storage.clone(), channels.clone(), repl_state.clone()).await;
+                    accumulator = remaining;
+                    repl_state.write().await.repl_offset += bytes_consumed;
+
+                    match &arr[0] {
+                        RespValue::BulkString(cmd) => {
+                            if cmd == b"REPLCONF" {
+                                stream.write_all(response.serialize().as_slice()).await.unwrap();
+                            }
+                        }
+                        _ => panic!("Should not reach"),
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        let mut buf = [0u8; 1024];
+        match stream.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => accumulator.extend_from_slice(&buf[..n]),
+            Err(e) => { eprintln!("[repl] read error: {:?}", e); break; }
+        }
     }
 }
