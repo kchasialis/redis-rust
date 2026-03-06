@@ -6,11 +6,12 @@ use redis_rs::resp_types::RespValue;
 use redis_rs::storage::Storage;
 use redis_rs::task_communication::Channels;
 use redis_rs::replication::{ReplicationState, ReplicationStateHandle};
+use redis_rs::persistence::{PersistenceState, PersistenceStateHandle, load_from_rdb};
 use redis_rs::{
-    handle_blpop_cmd, handle_echo_cmd, handle_get_cmd, handle_incr_cmd, handle_info_cmd,
-    handle_llen_cmd, handle_lpop_cmd, handle_lpush_cmd, handle_lrange_cmd, handle_ping_cmd,
-    handle_replconf_cmd, handle_rpush_cmd, handle_set_cmd, handle_type_cmd,
-    handle_xadd_cmd, handle_xrange_cmd, handle_xread_cmd,
+    handle_blpop_cmd, handle_config_cmd, handle_echo_cmd, handle_get_cmd, handle_incr_cmd,
+    handle_info_cmd, handle_keys_cmd, handle_llen_cmd, handle_lpop_cmd, handle_lpush_cmd,
+    handle_lrange_cmd, handle_ping_cmd, handle_replconf_cmd, handle_rpush_cmd, handle_set_cmd,
+    handle_type_cmd, handle_xadd_cmd, handle_xrange_cmd, handle_xread_cmd,
 };
 
 fn make_storage() -> Storage {
@@ -925,5 +926,193 @@ mod set_propagation {
         let after_first = r.read().await.repl_offset;
         handle_set_cmd(&cmd(&["SET", "baz", "789"]), s.clone(), r.clone()).await;
         assert!(r.read().await.repl_offset > after_first);
+    }
+}
+
+mod persistence {
+    use super::*;
+    use std::io::{Write, BufReader};
+    use std::sync::Arc;
+    use tempfile::NamedTempFile;
+
+    fn make_pers_state(dir: Option<String>, dbfilename: Option<String>) -> PersistenceStateHandle {
+        Arc::new(PersistenceState::new(dir, dbfilename))
+    }
+
+    fn minimal_rdb(entries: &[(&str, &str, Option<u64>)]) -> Vec<u8> {
+        let mut buf = Vec::new();
+
+        buf.extend_from_slice(b"REDIS0011");
+        buf.push(0xFA);
+        buf.extend_from_slice(b"\x09redis-ver\x055.0.0");
+
+        buf.push(0xFE);
+        buf.push(0x00);
+
+        buf.push(0xFB);
+        write_length(&mut buf, entries.len() as u32);
+        let expiry_count = entries.iter().filter(|(_, _, e)| e.is_some()).count();
+        write_length(&mut buf, expiry_count as u32);
+
+        for (key, value, expiry_ms) in entries {
+            if let Some(ms) = expiry_ms {
+                buf.push(0xFC);
+                buf.extend_from_slice(&ms.to_le_bytes());
+            }
+            buf.push(0x00);
+            write_string(&mut buf, key.as_bytes());
+            write_string(&mut buf, value.as_bytes());
+        }
+
+        buf.push(0xFF);
+        buf.extend_from_slice(&[0u8; 8]);
+
+        buf
+    }
+
+    fn write_length(buf: &mut Vec<u8>, len: u32) {
+        if len < 64 {
+            buf.push(len as u8);
+        } else {
+            buf.push(0x40 | ((len >> 8) as u8));
+            buf.push((len & 0xFF) as u8);
+        }
+    }
+
+    fn write_string(buf: &mut Vec<u8>, s: &[u8]) {
+        write_length(buf, s.len() as u32);
+        buf.extend_from_slice(s);
+    }
+
+    fn sorted_keys(v: RespValue) -> Vec<String> {
+        let mut keys = match v {
+            RespValue::Array(d) => d.iter().map(|e| match e {
+                RespValue::BulkString(b) => String::from_utf8(b.clone()).unwrap(),
+                _ => panic!("unexpected key type"),
+            }).collect::<Vec<_>>(),
+            _ => panic!("expected Array"),
+        };
+        keys.sort();
+        keys
+    }
+
+    #[tokio::test]
+    async fn config_get_dir() {
+        let p = make_pers_state(Some("/tmp/rdb-test".into()), Some("dump.rdb".into()));
+        let resp = handle_config_cmd(&cmd(&["CONFIG", "GET", "dir"]), p).await;
+        assert_eq!(
+            resp,
+            RespValue::Array({
+                let mut d = std::collections::VecDeque::new();
+                d.push_back(RespValue::BulkString(b"dir".to_vec()));
+                d.push_back(RespValue::BulkString(b"/tmp/rdb-test".to_vec()));
+                d
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn config_get_dbfilename() {
+        let p = make_pers_state(Some("/tmp".into()), Some("dump.rdb".into()));
+        let resp = handle_config_cmd(&cmd(&["CONFIG", "GET", "dbfilename"]), p).await;
+        assert_eq!(
+            resp,
+            RespValue::Array({
+                let mut d = std::collections::VecDeque::new();
+                d.push_back(RespValue::BulkString(b"dbfilename".to_vec()));
+                d.push_back(RespValue::BulkString(b"dump.rdb".to_vec()));
+                d
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn load_single_key() {
+        let rdb = minimal_rdb(&[("strawberry", "pear", None)]);
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(&rdb).unwrap();
+        let storage = make_storage();
+        let mut reader = BufReader::new(std::fs::File::open(tmp.path()).unwrap());
+        load_from_rdb(&mut reader, storage.clone()).await.unwrap();
+        assert_eq!(
+            handle_get_cmd(&cmd(&["GET", "strawberry"]), storage).await,
+            RespValue::BulkString(b"pear".to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn load_multiple_keys() {
+        let rdb = minimal_rdb(&[
+            ("mango", "strawberry", None),
+            ("banana", "grape", None),
+            ("pineapple", "blueberry", None),
+        ]);
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(&rdb).unwrap();
+        let storage = make_storage();
+        let mut reader = BufReader::new(std::fs::File::open(tmp.path()).unwrap());
+        load_from_rdb(&mut reader, storage.clone()).await.unwrap();
+
+        let keys = sorted_keys(handle_keys_cmd(&cmd(&["KEYS", "*"]), storage.clone()).await);
+        assert!(keys.contains(&"mango".to_string()));
+        assert!(keys.contains(&"banana".to_string()));
+        assert!(keys.contains(&"pineapple".to_string()));
+
+        assert_eq!(
+            handle_get_cmd(&cmd(&["GET", "banana"]), storage).await,
+            RespValue::BulkString(b"grape".to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn keys_cmd_after_load() {
+        let rdb = minimal_rdb(&[
+            ("mango", "x", None),
+            ("orange", "x", None),
+            ("banana", "x", None),
+            ("raspberry", "x", None),
+        ]);
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(&rdb).unwrap();
+        let storage = make_storage();
+        let mut reader = BufReader::new(std::fs::File::open(tmp.path()).unwrap());
+        load_from_rdb(&mut reader, storage.clone()).await.unwrap();
+
+        let keys = sorted_keys(handle_keys_cmd(&cmd(&["KEYS", "*"]), storage).await);
+        assert_eq!(keys, vec!["banana", "mango", "orange", "raspberry"]);
+    }
+
+    #[tokio::test]
+    async fn expired_key_not_returned() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH).unwrap()
+            .as_millis() as u64;
+        let past_ms = now_ms - 5000;
+        let future_ms = now_ms + 60_000;
+
+        let rdb = minimal_rdb(&[
+            ("raspberry", "strawberry", Some(future_ms)),
+            ("orange", "apple", Some(past_ms)),
+            ("blueberry", "pear", None),
+        ]);
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(&rdb).unwrap();
+        let storage = make_storage();
+        let mut reader = BufReader::new(std::fs::File::open(tmp.path()).unwrap());
+        load_from_rdb(&mut reader, storage.clone()).await.unwrap();
+
+        assert_eq!(
+            handle_get_cmd(&cmd(&["GET", "raspberry"]), storage.clone()).await,
+            RespValue::BulkString(b"strawberry".to_vec())
+        );
+        assert_eq!(
+            handle_get_cmd(&cmd(&["GET", "orange"]), storage.clone()).await,
+            RespValue::NullBulkString
+        );
+        assert_eq!(
+            handle_get_cmd(&cmd(&["GET", "blueberry"]), storage.clone()).await,
+            RespValue::BulkString(b"pear".to_vec())
+        );
     }
 }

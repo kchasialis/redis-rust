@@ -2,6 +2,7 @@ pub mod resp_types;
 pub mod storage;
 pub mod task_communication;
 pub mod replication;
+pub mod persistence;
 
 use storage::Storage;
 
@@ -16,6 +17,7 @@ use tokio::sync::mpsc;
 use std::collections::VecDeque;
 use clap::Parser;
 use tokio::time::timeout;
+use crate::persistence::PersistenceStateHandle;
 use crate::replication::{NodeRole, ReplicaConnection, ReplicaInfo, ReplicationStateHandle};
 use crate::task_communication::{Channels, WaiterRegistry};
 
@@ -29,7 +31,13 @@ pub struct Args {
     pub port: u16,
 
     #[arg(long)]
-    pub replicaof: Option<String>
+    pub replicaof: Option<String>,
+
+    #[arg(long)]
+    pub dir: Option<String>,
+
+    #[arg(long)]
+    pub dbfilename: Option<String>
 }
 
 pub fn handle_ping_cmd() -> RespValue {
@@ -666,11 +674,11 @@ pub async fn handle_psync_cmd(_args: &Vec<RespValue>, _storage: Storage, repl_st
     RespValue::SimpleString(result)
 }
 
-pub async fn handle_exec_cmd(storage: Storage, channels: Channels, command_queue: &mut VecDeque<Vec<RespValue>>, repl_state: ReplicationStateHandle) -> RespValue {
+pub async fn handle_exec_cmd(storage: Storage, channels: Channels, command_queue: &mut VecDeque<Vec<RespValue>>, repl_state: ReplicationStateHandle, pers_state: PersistenceStateHandle) -> RespValue {
     let mut result_vec = VecDeque::new();
 
     for command in command_queue.iter() {
-        let resp = handle_cmd(command, storage.clone(), channels.clone(), repl_state.clone()).await;
+        let resp = handle_cmd(command, storage.clone(), channels.clone(), repl_state.clone(), pers_state.clone()).await;
         result_vec.push_back(resp);
     }
 
@@ -730,7 +738,34 @@ pub async fn handle_wait_cmd(arr: &Vec<RespValue>, repl_state: ReplicationStateH
     RespValue::Integer(n_replicas as i64)
 }
 
-pub async fn handle_cmd(arr: &Vec<RespValue>, storage: Storage, channels: Channels, repl_state: ReplicationStateHandle) -> RespValue {
+pub async fn handle_config_cmd(arr: &Vec<RespValue>, pers_state: PersistenceStateHandle) -> RespValue {
+    let arg = parse_str_from_bulk_str(&arr[2]);
+
+    let mut result_vec = VecDeque::new();
+    if arg.eq("dir") {
+        result_vec.push_back(RespValue::BulkString(b"dir".to_vec()));
+        result_vec.push_back(RespValue::BulkString(pers_state.dir.clone().unwrap().into_bytes()));
+    } else {
+        result_vec.push_back(RespValue::BulkString(b"dbfilename".to_vec()));
+        result_vec.push_back(RespValue::BulkString(pers_state.dbfilename.clone().unwrap().into_bytes()));
+
+    }
+
+    RespValue::Array(result_vec)
+}
+
+pub async fn handle_keys_cmd(_arr: &Vec<RespValue>, storage: Storage) -> RespValue {
+    let guard = storage.read().await;
+
+    let mut result_vec = VecDeque::new();
+    for (key, _) in guard.iter() {
+        result_vec.push_back(RespValue::from(key.clone()));
+    }
+
+    RespValue::Array(result_vec)
+}
+
+pub async fn handle_cmd(arr: &Vec<RespValue>, storage: Storage, channels: Channels, repl_state: ReplicationStateHandle, pers_state: PersistenceStateHandle) -> RespValue {
     match &arr[0] {
         RespValue::BulkString(cmd) => {
             if cmd == b"PING" {
@@ -771,6 +806,10 @@ pub async fn handle_cmd(arr: &Vec<RespValue>, storage: Storage, channels: Channe
                 handle_psync_cmd(arr, storage, repl_state).await
             } else if cmd == b"WAIT" {
                 handle_wait_cmd(arr, repl_state).await
+            } else if cmd == b"CONFIG" {
+                handle_config_cmd(arr, pers_state).await
+            } else if cmd == b"KEYS" {
+                handle_keys_cmd(arr, storage).await
             } else {
                 RespValue::SimpleError(format!(
                     "ERR unknown command '{}'",
@@ -782,7 +821,7 @@ pub async fn handle_cmd(arr: &Vec<RespValue>, storage: Storage, channels: Channe
     }
 }
 
-pub async fn handle_connection(mut stream: TcpStream, storage: Storage, channels: Channels, repl_state: ReplicationStateHandle) -> std::io::Result<()> {
+pub async fn handle_connection(mut stream: TcpStream, storage: Storage, channels: Channels, repl_state: ReplicationStateHandle, pers_state: PersistenceStateHandle) -> std::io::Result<()> {
     let mut in_transaction = false;
     let mut command_queue: VecDeque<Vec<RespValue>> = VecDeque::new();
 
@@ -815,7 +854,7 @@ pub async fn handle_connection(mut stream: TcpStream, storage: Storage, channels
                 RespValue::SimpleError("ERR EXEC without MULTI".to_string())
             } else {
                 in_transaction = false;
-                handle_exec_cmd(storage.clone(), channels.clone(), &mut command_queue, repl_state.clone()).await
+                handle_exec_cmd(storage.clone(), channels.clone(), &mut command_queue, repl_state.clone(), pers_state.clone()).await
             }
         } else if cmd == b"DISCARD" {
             if !in_transaction {
@@ -829,7 +868,7 @@ pub async fn handle_connection(mut stream: TcpStream, storage: Storage, channels
             command_queue.push_back(arr.clone());
             RespValue::SimpleString("QUEUED".to_string())
         } else {
-            handle_cmd(&arr, storage.clone(), channels.clone(), repl_state.clone()).await
+            handle_cmd(&arr, storage.clone(), channels.clone(), repl_state.clone(), pers_state.clone()).await
         };
 
         stream.write_all(response.serialize().as_slice()).await?;
@@ -847,7 +886,7 @@ pub async fn handle_connection(mut stream: TcpStream, storage: Storage, channels
     }
 }
 
-pub async fn run_replication(replica_info: ReplicaInfo, port: u16, storage: Storage, channels: Channels, repl_state: ReplicationStateHandle) {
+pub async fn run_replication(replica_info: ReplicaInfo, port: u16, storage: Storage, channels: Channels, repl_state: ReplicationStateHandle, pers_state: PersistenceStateHandle) {
     let mut stream = TcpStream::connect(format!("{}:{}", replica_info.m_host, replica_info.m_port))
         .await
         .expect("Failed to connect to master");
@@ -902,7 +941,7 @@ pub async fn run_replication(replica_info: ReplicaInfo, port: u16, storage: Stor
                     let bytes_consumed = (accumulator.len() - remainder.len()) as u64;
                     let RespValue::Array(deque) = val else { panic!("Expected array"); };
                     let arr: Vec<RespValue> = deque.iter().cloned().collect();
-                    let response = handle_cmd(&arr, storage.clone(), channels.clone(), repl_state.clone()).await;
+                    let response = handle_cmd(&arr, storage.clone(), channels.clone(), repl_state.clone(), pers_state.clone()).await;
                     accumulator = remaining;
                     repl_state.write().await.repl_offset += bytes_consumed;
 
