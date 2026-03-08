@@ -7,11 +7,13 @@ use redis_rs::storage::Storage;
 use redis_rs::task_communication::Channels;
 use redis_rs::replication::{ReplicationState, ReplicationStateHandle};
 use redis_rs::persistence::{PersistenceState, PersistenceStateHandle, load_from_rdb};
+use redis_rs::pub_sub::Subscriptions;
 use redis_rs::{
     handle_blpop_cmd, handle_config_cmd, handle_echo_cmd, handle_get_cmd, handle_incr_cmd,
     handle_info_cmd, handle_keys_cmd, handle_llen_cmd, handle_lpop_cmd, handle_lpush_cmd,
-    handle_lrange_cmd, handle_ping_cmd, handle_replconf_cmd, handle_rpush_cmd, handle_set_cmd,
-    handle_type_cmd, handle_xadd_cmd, handle_xrange_cmd, handle_xread_cmd,
+    handle_lrange_cmd, handle_ping_cmd, handle_publish_cmd, handle_replconf_cmd, handle_rpush_cmd,
+    handle_set_cmd, handle_subscribe_cmd, handle_unsubscribe_cmd, handle_type_cmd,
+    handle_xadd_cmd, handle_xrange_cmd, handle_xread_cmd,
 };
 
 fn make_storage() -> Storage {
@@ -128,20 +130,20 @@ mod ping {
 
     #[test]
     fn returns_pong() {
-        assert_eq!(handle_ping_cmd(), RespValue::SimpleString("PONG".into()));
+        assert_eq!(handle_ping_cmd(false), RespValue::SimpleString("PONG".into()));
     }
 
     #[test]
     fn stateless_repeated() {
         for _ in 0..3 {
-            assert_eq!(handle_ping_cmd(), RespValue::SimpleString("PONG".into()));
+            assert_eq!(handle_ping_cmd(false), RespValue::SimpleString("PONG".into()));
         }
     }
 
     #[tokio::test]
     async fn concurrent_clients() {
         let handles: Vec<_> = (0..6)
-            .map(|_| tokio::spawn(async { handle_ping_cmd() }))
+            .map(|_| tokio::spawn(async { handle_ping_cmd(false) }))
             .collect();
         for h in handles {
             assert_eq!(h.await.unwrap(), RespValue::SimpleString("PONG".into()));
@@ -1114,5 +1116,179 @@ mod persistence {
             handle_get_cmd(&cmd(&["GET", "blueberry"]), storage.clone()).await,
             RespValue::BulkString(b"pear".to_vec())
         );
+    }
+}
+
+mod pub_sub {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+    use tokio::sync::mpsc;
+    use tokio::task::JoinHandle;
+    use redis_rs::pub_sub::RecvValue;
+
+    fn make_subscriptions() -> Subscriptions {
+        Arc::new(RwLock::new(HashMap::new()))
+    }
+
+    fn make_channel_tasks() -> HashMap<String, JoinHandle<()>> {
+        HashMap::new()
+    }
+
+    #[tokio::test]
+    async fn subscribe_returns_confirmation() {
+        let subs = make_subscriptions();
+        let mut tasks = make_channel_tasks();
+        let (tx, _rx) = mpsc::channel::<RecvValue>(16);
+        let mut count = 0usize;
+
+        let resp = handle_subscribe_cmd(
+            &cmd(&["SUBSCRIBE", "channel1"]),
+            &mut count,
+            subs,
+            &mut tasks,
+            &tx,
+        ).await;
+
+        assert_eq!(
+            resp,
+            RespValue::Array({
+                let mut d = std::collections::VecDeque::new();
+                d.push_back(RespValue::BulkString(b"subscribe".to_vec()));
+                d.push_back(RespValue::BulkString(b"channel1".to_vec()));
+                d.push_back(RespValue::Integer(1));
+                d
+            })
+        );
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn subscribe_increments_count() {
+        let subs = make_subscriptions();
+        let mut tasks = make_channel_tasks();
+        let (tx, _rx) = mpsc::channel::<RecvValue>(16);
+        let mut count = 0usize;
+
+        handle_subscribe_cmd(&cmd(&["SUBSCRIBE", "ch1"]), &mut count, subs.clone(), &mut tasks, &tx).await;
+        let resp = handle_subscribe_cmd(&cmd(&["SUBSCRIBE", "ch2"]), &mut count, subs, &mut tasks, &tx).await;
+
+        assert_eq!(
+            resp,
+            RespValue::Array({
+                let mut d = std::collections::VecDeque::new();
+                d.push_back(RespValue::BulkString(b"subscribe".to_vec()));
+                d.push_back(RespValue::BulkString(b"ch2".to_vec()));
+                d.push_back(RespValue::Integer(2));
+                d
+            })
+        );
+        assert_eq!(count, 2);
+    }
+
+    #[tokio::test]
+    async fn publish_to_subscribed_channel_delivers_message() {
+        let subs = make_subscriptions();
+        let mut tasks = make_channel_tasks();
+        let (fwd_tx, mut fwd_rx) = mpsc::channel::<RecvValue>(16);
+        let mut count = 0usize;
+
+        handle_subscribe_cmd(
+            &cmd(&["SUBSCRIBE", "news"]),
+            &mut count,
+            subs.clone(),
+            &mut tasks,
+            &fwd_tx,
+        ).await;
+
+        let resp = handle_publish_cmd(
+            &cmd(&["PUBLISH", "news", "hello"]),
+            subs,
+        ).await;
+
+        assert_eq!(resp, RespValue::Integer(1));
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let received = fwd_rx.try_recv().expect("expected a forwarded message");
+        assert_eq!(received.channel, "news");
+        assert_eq!(received.value, RespValue::BulkString(b"hello".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn publish_to_channel_with_no_subscribers_returns_zero() {
+        let subs = make_subscriptions();
+
+        let resp = handle_publish_cmd(
+            &cmd(&["PUBLISH", "empty_channel", "hello"]),
+            subs,
+        ).await;
+
+        assert_eq!(resp, RespValue::Integer(0));
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_decrements_count_and_returns_confirmation() {
+        let subs = make_subscriptions();
+        let mut tasks = make_channel_tasks();
+        let (tx, _rx) = mpsc::channel::<RecvValue>(16);
+        let mut count = 0usize;
+
+        handle_subscribe_cmd(&cmd(&["SUBSCRIBE", "ch1"]), &mut count, subs.clone(), &mut tasks, &tx).await;
+        handle_subscribe_cmd(&cmd(&["SUBSCRIBE", "ch2"]), &mut count, subs.clone(), &mut tasks, &tx).await;
+
+        let resp = handle_unsubscribe_cmd(
+            &cmd(&["UNSUBSCRIBE", "ch1"]),
+            &mut count,
+            &mut tasks,
+        ).await;
+
+        assert_eq!(
+            resp,
+            RespValue::Array({
+                let mut d = std::collections::VecDeque::new();
+                d.push_back(RespValue::BulkString(b"unsubscribe".to_vec()));
+                d.push_back(RespValue::BulkString(b"ch1".to_vec()));
+                d.push_back(RespValue::Integer(1));
+                d
+            })
+        );
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn ping_in_subscribe_mode_returns_array() {
+        let resp = handle_ping_cmd(true);
+
+        assert_eq!(
+            resp,
+            RespValue::Array({
+                let mut d = std::collections::VecDeque::new();
+                d.push_back(RespValue::BulkString(b"pong".to_vec()));
+                d.push_back(RespValue::BulkString(b"".to_vec()));
+                d
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_to_multiple_subscribers_delivers_to_all() {
+        let subs = make_subscriptions();
+        let mut tasks1 = make_channel_tasks();
+        let mut tasks2 = make_channel_tasks();
+        let (tx1, mut rx1) = mpsc::channel::<RecvValue>(16);
+        let (tx2, mut rx2) = mpsc::channel::<RecvValue>(16);
+        let mut count1 = 0usize;
+        let mut count2 = 0usize;
+
+        handle_subscribe_cmd(&cmd(&["SUBSCRIBE", "sports"]), &mut count1, subs.clone(), &mut tasks1, &tx1).await;
+        handle_subscribe_cmd(&cmd(&["SUBSCRIBE", "sports"]), &mut count2, subs.clone(), &mut tasks2, &tx2).await;
+
+        let resp = handle_publish_cmd(&cmd(&["PUBLISH", "sports", "goal"]), subs).await;
+        assert_eq!(resp, RespValue::Integer(2));
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(rx1.try_recv().is_ok());
+        assert!(rx2.try_recv().is_ok());
     }
 }

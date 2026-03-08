@@ -1,14 +1,15 @@
 # Redis Server Clone
 
-A Redis-compatible server implemented from scratch in Rust. The server implements the Redis Serialization Protocol (RESP) and handles multiple concurrent clients via an **asynchronous event loop** powered by [Tokio](https://tokio.rs/).
+A Redis server clone implemented from scratch in Rust. The server implements the Redis Serialization Protocol (RESP) and handles multiple concurrent clients via an asynchronous event loop using [Tokio](https://tokio.rs/).
 
 ## Architecture
 
-- **Async I/O** — Each client connection runs in its own Tokio task. There is no thread-per-client overhead; the Tokio runtime multiplexes thousands of connections over a small thread pool.
+- **Async I/O** — Each client connection runs in its own Tokio task and yields CPU when waiting for I/O to other tasks. 
 - **Shared state** — In-memory storage is a `HashMap` wrapped in `Arc<RwLock<...>>`, allowing safe concurrent reads and serialized writes across tasks.
 - **Inter-task communication** — Blocking commands (`BLPOP`, blocking `XREAD`) use Tokio `mpsc` channels. A per-key queue is used for senders so that the first writer wakes the first waiter in FIFO order.
 - **RESP parser** — A handwritten RESP v2/v3 parser handles serialization and deserialization of all protocol types.
 - **Replication** — A master-replica model is implemented using the PSYNC handshake protocol. The master propagates write commands to all connected replicas over persistent TCP connections. Replicas track their byte offset and respond to `REPLCONF GETACK` so the master can verify replication progress via `WAIT`.
+- **Pub/Sub** — A global `Subscriptions` registry maps channel names to Tokio `broadcast::Sender`s. Each `SUBSCRIBE` call spawns a per-channel task that forwards received messages over a per-connection `mpsc` channel, which the connection loop selects alongside incoming client reads.
 
 ## Supported Commands
 
@@ -66,6 +67,14 @@ Commands issued after `MULTI` return `QUEUED` and are executed atomically when `
 | `PSYNC` | `PSYNC <replid> <offset>` | Initiates full replication sync and RDB transfer |
 | `WAIT` | `WAIT <numreplicas> <timeout>` | Blocks until `numreplicas` replicas have acknowledged the current offset, or `timeout` ms elapses |
 
+### Pub/Sub
+
+| Command | Syntax | Description |
+|---------|--------|-------------|
+| `SUBSCRIBE` | `SUBSCRIBE <channel>` | Subscribe to a channel; receives a confirmation and subsequent `message` pushes |
+| `UNSUBSCRIBE` | `UNSUBSCRIBE <channel>` | Unsubscribe from a channel |
+| `PUBLISH` | `PUBLISH <channel> <message>` | Publish a message to all subscribers; returns subscriber count |
+
 ## Replication
 
 The server supports a **master-replica** topology. A replica is started by passing `--replicaof <host> <port>`.
@@ -105,6 +114,7 @@ If the master offset is still 0 (no writes have occurred), `WAIT` returns the to
 - **Replication state** is stored behind an `Arc<RwLock<ReplicationState>>`. Each replica connection is stored as a split `OwnedReadHalf`/`OwnedWriteHalf` pair so the master can write propagated commands and simultaneously read `REPLCONF ACK` responses.
 - **RDB transfer** — The master sends a minimal valid empty RDB file immediately after `FULLRESYNC` using the standard `$<len>\r\n<bytes>` framing (no trailing `\r\n`, as per the Redis wire format).
 - **RESP protocol** — Full RESP v2 support plus v3 types (Boolean, Double, BigNumber, BulkError, Map, Set, VerbatimString).
+- **Pub/Sub** — A client entering subscribe mode is restricted to `SUBSCRIBE`, `UNSUBSCRIBE`, and `PING`. The connection loop uses `tokio::select!` to simultaneously wait for new client commands and for messages forwarded from the broadcast channel, ensuring message delivery without blocking.
 
 ## Build & Run
 
@@ -113,10 +123,13 @@ git clone https://github.com/kchasialis/redis-rust.git
 cd redis-rust
 cargo build --release
 
+# Standalone master on default port 6379
 ./target/release/redis-rs
 
+# Custom port
 ./target/release/redis-rs --port 6385
 
+# Replica of another instance
 ./target/release/redis-rs --port 6380 --replicaof "localhost 6379"
 ```
 
@@ -144,7 +157,7 @@ redis-cli wait 1 500
 
 ## Testing
 
-Tests live in the `tests/` directory and are organized by module. Run the full suite or a specific group:
+Tests are located in the `tests/` directory and are organized by module. Run the full suite or a specific group:
 
 ```bash
 # Full suite
@@ -152,33 +165,9 @@ cargo test
 
 # Specific module
 cargo test ping
-cargo test xread
-cargo test replication_state
-cargo test replconf
-cargo test set_propagation
+cargo test persistence
+cargo test pub_sub
 ```
-
-| Module | Tests |
-|---|---|
-| `resp_serialization` | `simple_string`, `bulk_string`, `integer`, `null_bulk_string_wire_format`, `null_array_wire_format`, `nested_array`, `simple_error` |
-| `stream_id` | `ordering`, `display` |
-| `ping` | `returns_pong`, `stateless_repeated`, `concurrent_clients` |
-| `echo` | `echoes_argument`, `preserves_spaces` |
-| `set_get` | `basic_set_then_get`, `get_missing_key_returns_null`, `set_overwrites_existing_key`, `px_expiry`, `ex_expiry_alive_within_window` |
-| `type_cmd` | `string_type`, `missing_key_is_none`, `stream_type` |
-| `push` | `rpush_creates_list_of_one`, `rpush_increments_length`, `rpush_multiple_values`, `lpush_prepends_in_order` |
-| `lrange` | `positive_indexes`, `negative_indexes` |
-| `lpop` | `single_pop`, `pop_with_count`, `missing_key_returns_null` |
-| `llen` | `existing_and_missing` |
-| `blpop` | `timeout_returns_null_array`, `wakes_on_rpush`, `only_one_waiter_woken_per_push` |
-| `xadd` | `explicit_id_is_returned`, `rejects_zero_zero_id`, `rejects_non_monotonic_ids`, `partial_auto_sequence`, `full_auto_id_format` |
-| `xrange` | `explicit_bounds`, `minus_lower_bound`, `plus_upper_bound`, `missing_key_returns_empty` |
-| `xread` | `single_stream`, `multiple_streams`, `block_wakes_on_xadd`, `block_timeout_returns_null`, `block_dollar_reads_only_future_entries` |
-| `incr` | `increments_from_zero_when_missing`, `increments_existing_integer_key`, `errors_on_non_integer_value` |
-| `info` | `master_role_and_offset`, `replica_role` |
-| `replconf` | `listening_port_returns_ok`, `capa_psync2_returns_ok`, `getack_returns_replconf_ack_offset`, `getack_reflects_replica_offset` |
-| `replication_state` | `master_starts_with_unique_replid`, `master_and_replica_start_at_zero_offset`, `replica_stores_master_info` |
-| `set_propagation` | `offset_advances_after_set`, `offset_advances_cumulatively` |
 
 ## License
 
