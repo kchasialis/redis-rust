@@ -7,6 +7,7 @@ use redis_rs::replication::{ReplicaInfo, ReplicationState, ReplicationStateHandl
 use redis_rs::persistence::{PersistenceState, PersistenceStateHandle, load_from_rdb};
 use redis_rs::resp_types::RespValue;
 use redis_rs::pub_sub::Subscriptions;
+use redis_rs::authentication::UsersAuth;
 
 use std::collections::HashMap;
 use std::io::Result;
@@ -43,6 +44,7 @@ async fn main() -> Result<()> {
         },
         None => Arc::new(RwLock::new(ReplicationState::new_master())),
     };
+    let users_auth: UsersAuth = Arc::new(RwLock::new(HashMap::new()));
 
     if let Some(mut reader) = pers_state.open() {
         load_from_rdb(&mut reader, storage.clone()).await.expect("Failed to load RDB file");
@@ -57,8 +59,9 @@ async fn main() -> Result<()> {
         let repl_state_clone = Arc::clone(&repl_state);
         let pers_state_clone = Arc::clone(&pers_state);
         let subs_clone = Arc::clone(&subscriptions);
+        let users_auth_clone = Arc::clone(&users_auth);
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(socket, storage_clone, channels_clone, repl_state_clone, pers_state_clone, subs_clone).await {
+            if let Err(e) = handle_connection(socket, storage_clone, channels_clone, repl_state_clone, pers_state_clone, subs_clone, users_auth_clone).await {
                 eprintln!("connection error: {:?}", e);
             }
         });

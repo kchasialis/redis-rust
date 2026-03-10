@@ -4,6 +4,7 @@ pub mod task_communication;
 pub mod replication;
 pub mod persistence;
 pub mod pub_sub;
+pub mod authentication;
 
 use storage::Storage;
 
@@ -20,10 +21,12 @@ use std::collections::VecDeque;
 use clap::Parser;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
+use crate::authentication::{UserInfo, UsersAuth};
 use crate::persistence::PersistenceStateHandle;
 use crate::pub_sub::{Subscriptions, RecvValue};
 use crate::replication::{NodeRole, ReplicaConnection, ReplicaInfo, ReplicationStateHandle};
 use crate::task_communication::{Channels, WaiterRegistry};
+use sha2::{Sha256, Digest};
 
 #[derive(Parser, Debug)]
 #[command(name = "redis-server", about = "A Redis-like server")]
@@ -766,7 +769,7 @@ pub async fn handle_config_cmd(arr: &Vec<RespValue>, pers_state: PersistenceStat
     RespValue::Array(result_vec)
 }
 
-pub async fn handle_keys_cmd(_arr: &Vec<RespValue>, storage: Storage) -> RespValue {
+pub async fn handle_keys_cmd(storage: Storage) -> RespValue {
     let guard = storage.read().await;
 
     let mut result_vec = VecDeque::new();
@@ -775,6 +778,55 @@ pub async fn handle_keys_cmd(_arr: &Vec<RespValue>, storage: Storage) -> RespVal
     }
 
     RespValue::Array(result_vec)
+}
+
+pub async fn handle_acl_cmds(arr: &Vec<RespValue>, conn: &mut ConnectionState, users_auth: UsersAuth) -> RespValue {
+    let acl_subcmd = parse_str_from_bulk_str(&arr[1]);
+
+    if acl_subcmd.eq("whoami") {
+        RespValue::BulkString(conn.username.clone().into_bytes())
+    } else if acl_subcmd.eq("getuser") {
+        let mut passwords_vec = VecDeque::new();
+        let mut flags_vec = VecDeque::new();
+        if let Some(user_info) = users_auth.read().await.get(&conn.username) {
+            for pw in user_info.password_hashes.iter() {
+                passwords_vec.push_back(RespValue::BulkString(pw.clone().into_bytes()))
+            }
+        } else {
+            flags_vec.push_back(RespValue::BulkString(b"nopass".to_vec()));
+        }
+
+        let result_vec = VecDeque::from([
+            RespValue::BulkString(b"flags".to_vec()),
+            RespValue::Array(flags_vec),
+            RespValue::BulkString(b"passwords".to_vec()),
+            RespValue::Array(passwords_vec)
+        ]);
+
+        RespValue::Array(result_vec)
+    } else if acl_subcmd.eq("setuser") {
+        let username = parse_str_from_bulk_str(&arr[2]);
+        let password = parse_str_from_bulk_str(&arr[3]);
+        let password_hash = hex::encode(Sha256::digest(&password[1..]));
+        let mut guard = users_auth.write().await;
+        match guard.get_mut(&username) {
+            Some(user_info) => {
+                user_info.nopass = false;
+                user_info.password_hashes.push(password_hash);
+            },
+            None => {
+                guard.insert(username, UserInfo {
+                    password_hashes: Vec::from([password_hash]),
+                    nopass: false,
+                    enabled: true
+                });
+            }
+        }
+
+        RespValue::SimpleString("OK".to_string())
+    } else {
+        RespValue::SimpleError(format!("ERR unknown command '{}'", acl_subcmd))
+    }
 }
 
 pub async fn handle_shared_cmd(arr: &Vec<RespValue>, storage: Storage, channels: Channels, repl_state: ReplicationStateHandle, pers_state: PersistenceStateHandle) -> RespValue {
@@ -821,7 +873,7 @@ pub async fn handle_shared_cmd(arr: &Vec<RespValue>, storage: Storage, channels:
             } else if cmd == b"CONFIG" {
                 handle_config_cmd(arr, pers_state).await
             } else if cmd == b"KEYS" {
-                handle_keys_cmd(arr, storage).await
+                handle_keys_cmd(storage).await
             } else {
                 RespValue::SimpleError(format!(
                     "ERR unknown command '{}'",
@@ -833,7 +885,7 @@ pub async fn handle_shared_cmd(arr: &Vec<RespValue>, storage: Storage, channels:
     }
 }
 
-pub async fn handle_subscribe_cmd(arr: &Vec<RespValue>, subscribed_count: &mut usize, subscriptions: Subscriptions, channel_tasks: &mut HashMap<String, JoinHandle<()>>, fwd_tx: &mpsc::Sender<RecvValue>) -> RespValue {
+pub async fn handle_subscribe_cmd(arr: &Vec<RespValue>, conn: &mut ConnectionState, subscriptions: Subscriptions) -> RespValue {
     let channel = parse_str_from_bulk_str(&arr[1]);
 
     let mut receiver = {
@@ -849,7 +901,7 @@ pub async fn handle_subscribe_cmd(arr: &Vec<RespValue>, subscribed_count: &mut u
             }
         }
     };
-    let fwd_tx_clone = fwd_tx.clone();
+    let fwd_tx_clone = conn.fwd_tx.clone();
     let handle = tokio::spawn(async move {
         while let Ok(val) = receiver.recv().await {
             if fwd_tx_clone.send(val).await.is_err() {
@@ -857,44 +909,44 @@ pub async fn handle_subscribe_cmd(arr: &Vec<RespValue>, subscribed_count: &mut u
             }
         }
     });
-    channel_tasks.insert(channel.clone(), handle);
-    *subscribed_count += 1;
+    conn.channel_tasks.insert(channel.clone(), handle);
+    conn.subscribed_count += 1;
 
     let result_vec = VecDeque::from([
         RespValue::BulkString(b"subscribe".to_vec()),
         RespValue::BulkString(parse_str_from_bulk_str(&arr[1]).into_bytes()),
-        RespValue::Integer(*subscribed_count as i64)
+        RespValue::Integer(conn.subscribed_count as i64)
     ]);
 
     RespValue::Array(result_vec)
 }
 
-pub async fn handle_unsubscribe_cmd(arr: &Vec<RespValue>, subscribed_count: &mut usize, channel_tasks: &mut HashMap<String, JoinHandle<()>>) -> RespValue {
+pub async fn handle_unsubscribe_cmd(arr: &Vec<RespValue>, conn: &mut ConnectionState) -> RespValue {
     let channel = parse_str_from_bulk_str(&arr[1]);
 
-    if let Some(handle) = channel_tasks.remove(&channel) {
-        *subscribed_count -= 1;
+    if let Some(handle) = conn.channel_tasks.remove(&channel) {
+        conn.subscribed_count -= 1;
         handle.abort();
     }
 
     let result_vec = VecDeque::from([
         RespValue::BulkString(b"unsubscribe".to_vec()),
         RespValue::BulkString(channel.into_bytes()),
-        RespValue::Integer(*subscribed_count as i64)
+        RespValue::Integer(conn.subscribed_count as i64)
     ]);
 
     RespValue::Array(result_vec)
 }
 
-pub async fn handle_subscribe_cmds(arr: &Vec<RespValue>, subscribed_count: &mut usize, subscriptions: Subscriptions, channel_tasks: &mut HashMap<String, JoinHandle<()>>, fwd_tx: &mpsc::Sender<RecvValue>) -> RespValue {
+pub async fn handle_subscribe_cmds(arr: &Vec<RespValue>, conn: &mut ConnectionState, subscriptions: Subscriptions) -> RespValue {
     let cmd = parse_str_from_bulk_str(&arr[0]);
 
     if cmd.eq("subscribe") {
-        handle_subscribe_cmd(arr, subscribed_count, subscriptions, channel_tasks, fwd_tx).await
+        handle_subscribe_cmd(arr, conn, subscriptions).await
     } else if cmd.eq("ping") {
-        handle_ping_cmd(*subscribed_count > 0)
+        handle_ping_cmd(conn.subscribed_count > 0)
     } else if cmd.eq("unsubscribe") {
-        handle_unsubscribe_cmd(arr, subscribed_count, channel_tasks).await
+        handle_unsubscribe_cmd(arr, conn).await
     } else {
         panic!("Received unhandled command in subscribe mode")
     }
@@ -920,17 +972,62 @@ pub async fn handle_publish_cmd(arr: &Vec<RespValue>, subscriptions: Subscriptio
     RespValue::Integer(subs as i64)
 }
 
-pub async fn handle_connection(mut stream: TcpStream, storage: Storage, channels: Channels, repl_state: ReplicationStateHandle, pers_state: PersistenceStateHandle, subscriptions: Subscriptions) -> std::io::Result<()> {
-    let mut in_transaction = false;
-    let mut command_queue: VecDeque<Vec<RespValue>> = VecDeque::new();
-    let mut subscribed_count: usize = 0;
+pub struct ConnectionState {
+    pub username: String,
+    pub in_transaction: bool,
+    pub authenticated: bool,
+    pub command_queue: VecDeque<Vec<RespValue>>,
+    pub subscribed_count: usize,
+    pub channel_tasks: HashMap<String, JoinHandle<()>>,
+    pub fwd_tx: mpsc::Sender<RecvValue>,
+    pub fwd_rx: mpsc::Receiver<RecvValue>,
+}
+
+impl ConnectionState {
+    pub fn new() -> Self {
+        let (fwd_tx, fwd_rx) = mpsc::channel(16);
+        Self {
+            username: "default".to_string(),
+            in_transaction: false,
+            authenticated: true,
+            command_queue: VecDeque::new(),
+            subscribed_count: 0,
+            channel_tasks: HashMap::new(),
+            fwd_tx,
+            fwd_rx,
+        }
+    }
+}
+
+pub async fn handle_auth_cmd(arr: &Vec<RespValue>, conn: &mut ConnectionState, users_auth: UsersAuth) -> RespValue {
+    let username = parse_str_from_bulk_str(&arr[1]);
+    let password = parse_str_from_bulk_str(&arr[2]);
+
+    for pass in users_auth.read().await.get(&username).unwrap().password_hashes.iter() {
+        let pass_sha = hex::encode(Sha256::digest(&password));
+        if pass.eq(&pass_sha) {
+            conn.authenticated = true;
+            return RespValue::SimpleString("OK".to_string())
+        }
+    }
+
+    RespValue::SimpleError("WRONGPASS invalid username-password pair or user is disabled.".to_string())
+}
+
+pub async fn handle_connection(mut stream: TcpStream, storage: Storage, channels: Channels, repl_state: ReplicationStateHandle, pers_state: PersistenceStateHandle, subscriptions: Subscriptions, users_auth: UsersAuth) -> std::io::Result<()> {
     let sub_cmds: HashSet<&[u8]> = HashSet::from([
         b"SUBSCRIBE" as &[u8],
         b"UNSUBSCRIBE",
         b"PING",
     ]);
-    let (fwd_tx, mut fwd_rx) = mpsc::channel::<RecvValue>(16);
-    let mut channel_tasks: HashMap<String, JoinHandle<()>> = HashMap::new();
+
+    let mut conn = ConnectionState::new();
+
+    conn.authenticated = if let Some(user_info) = users_auth.read().await.get(&conn.username) {
+        user_info.nopass == true
+    } else {
+        true
+    };
 
     let mut buf = [0u8; 1024];
     loop {
@@ -942,7 +1039,7 @@ pub async fn handle_connection(mut stream: TcpStream, storage: Storage, channels
                     Err(e) => { eprintln!("failed to read from socket; err = {:?}", e); return Ok(()); }
                 }
             },
-            result = fwd_rx.recv() => {
+            result = conn.fwd_rx.recv() => {
                 if let Some(val) = result {
                     let response = RespValue::Array(VecDeque::from([
                         RespValue::BulkString(b"message".to_vec()),
@@ -965,36 +1062,42 @@ pub async fn handle_connection(mut stream: TcpStream, storage: Storage, channels
             panic!("Expected bulk string as array element in command");
         };
 
-        let subscribed_mode = subscribed_count > 0;
+        let subscribed_mode = conn.subscribed_count > 0;
 
-        let response = if subscribed_mode && !sub_cmds.contains(cmd.as_slice()) {
+        let response = if !conn.authenticated && cmd != b"AUTH" {
+            RespValue::SimpleError("NOAUTH Authentication required.".to_string())
+        } else if subscribed_mode && !sub_cmds.contains(cmd.as_slice()) {
             RespValue::SimpleError(format!("ERR Can't execute '{}'", String::from_utf8(cmd.clone()).unwrap().to_lowercase()))
         } else if sub_cmds.contains(cmd.as_slice()) {
-            handle_subscribe_cmds(&arr, &mut subscribed_count, subscriptions.clone(), &mut channel_tasks, &fwd_tx).await
+            handle_subscribe_cmds(&arr, &mut conn, subscriptions.clone()).await
         } else if cmd == b"MULTI" {
-            in_transaction = true;
+            conn.in_transaction = true;
             RespValue::SimpleString("OK".to_string())
         } else if cmd == b"EXEC" {
-            if !in_transaction {
+            if !conn.in_transaction {
                 RespValue::SimpleError("ERR EXEC without MULTI".to_string())
             } else {
-                in_transaction = false;
-                handle_exec_cmd(storage.clone(), channels.clone(), &mut command_queue, repl_state.clone(), pers_state.clone()).await
+                conn.in_transaction = false;
+                handle_exec_cmd(storage.clone(), channels.clone(), &mut conn.command_queue, repl_state.clone(), pers_state.clone()).await
             }
         } else if cmd == b"DISCARD" {
-            if !in_transaction {
+            if !conn.in_transaction {
                 RespValue::SimpleError("ERR DISCARD without MULTI".to_string())
             } else {
-                in_transaction = false;
-                command_queue.clear();
+                conn.in_transaction = false;
+                conn.command_queue.clear();
                 RespValue::SimpleString("OK".to_string())
             }
-        } else if in_transaction {
-            command_queue.push_back(arr.clone());
+        } else if conn.in_transaction {
+            conn.command_queue.push_back(arr.clone());
             RespValue::SimpleString("QUEUED".to_string())
         } else if cmd == b"PUBLISH" {
             handle_publish_cmd(&arr, subscriptions.clone()).await
-        }  else {
+        } else if cmd == b"ACL" {
+            handle_acl_cmds(&arr, &mut conn, users_auth.clone()).await
+        } else if cmd == b"AUTH" {
+            handle_auth_cmd(&arr, &mut conn, users_auth.clone()).await
+        } else {
             handle_shared_cmd(&arr, storage.clone(), channels.clone(), repl_state.clone(), pers_state.clone()).await
         };
 

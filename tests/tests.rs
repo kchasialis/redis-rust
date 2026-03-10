@@ -1055,7 +1055,7 @@ mod persistence {
         let mut reader = BufReader::new(std::fs::File::open(tmp.path()).unwrap());
         load_from_rdb(&mut reader, storage.clone()).await.unwrap();
 
-        let keys = sorted_keys(handle_keys_cmd(&cmd(&["KEYS", "*"]), storage.clone()).await);
+        let keys = sorted_keys(handle_keys_cmd(storage.clone()).await);
         assert!(keys.contains(&"mango".to_string()));
         assert!(keys.contains(&"banana".to_string()));
         assert!(keys.contains(&"pineapple".to_string()));
@@ -1080,7 +1080,7 @@ mod persistence {
         let mut reader = BufReader::new(std::fs::File::open(tmp.path()).unwrap());
         load_from_rdb(&mut reader, storage.clone()).await.unwrap();
 
-        let keys = sorted_keys(handle_keys_cmd(&cmd(&["KEYS", "*"]), storage).await);
+        let keys = sorted_keys(handle_keys_cmd(storage).await);
         assert_eq!(keys, vec!["banana", "mango", "orange", "raspberry"]);
     }
 
@@ -1124,31 +1124,21 @@ mod pub_sub {
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::RwLock;
-    use tokio::sync::mpsc;
-    use tokio::task::JoinHandle;
-    use redis_rs::pub_sub::RecvValue;
+    use redis_rs::ConnectionState;
 
     fn make_subscriptions() -> Subscriptions {
         Arc::new(RwLock::new(HashMap::new()))
     }
 
-    fn make_channel_tasks() -> HashMap<String, JoinHandle<()>> {
-        HashMap::new()
-    }
-
     #[tokio::test]
     async fn subscribe_returns_confirmation() {
         let subs = make_subscriptions();
-        let mut tasks = make_channel_tasks();
-        let (tx, _rx) = mpsc::channel::<RecvValue>(16);
-        let mut count = 0usize;
+        let mut conn = ConnectionState::new();
 
         let resp = handle_subscribe_cmd(
             &cmd(&["SUBSCRIBE", "channel1"]),
-            &mut count,
+            &mut conn,
             subs,
-            &mut tasks,
-            &tx,
         ).await;
 
         assert_eq!(
@@ -1161,18 +1151,16 @@ mod pub_sub {
                 d
             })
         );
-        assert_eq!(count, 1);
+        assert_eq!(conn.subscribed_count, 1);
     }
 
     #[tokio::test]
     async fn subscribe_increments_count() {
         let subs = make_subscriptions();
-        let mut tasks = make_channel_tasks();
-        let (tx, _rx) = mpsc::channel::<RecvValue>(16);
-        let mut count = 0usize;
+        let mut conn = ConnectionState::new();
 
-        handle_subscribe_cmd(&cmd(&["SUBSCRIBE", "ch1"]), &mut count, subs.clone(), &mut tasks, &tx).await;
-        let resp = handle_subscribe_cmd(&cmd(&["SUBSCRIBE", "ch2"]), &mut count, subs, &mut tasks, &tx).await;
+        handle_subscribe_cmd(&cmd(&["SUBSCRIBE", "ch1"]), &mut conn, subs.clone()).await;
+        let resp = handle_subscribe_cmd(&cmd(&["SUBSCRIBE", "ch2"]), &mut conn, subs).await;
 
         assert_eq!(
             resp,
@@ -1184,22 +1172,18 @@ mod pub_sub {
                 d
             })
         );
-        assert_eq!(count, 2);
+        assert_eq!(conn.subscribed_count, 2);
     }
 
     #[tokio::test]
     async fn publish_to_subscribed_channel_delivers_message() {
         let subs = make_subscriptions();
-        let mut tasks = make_channel_tasks();
-        let (fwd_tx, mut fwd_rx) = mpsc::channel::<RecvValue>(16);
-        let mut count = 0usize;
+        let mut conn = ConnectionState::new();
 
         handle_subscribe_cmd(
             &cmd(&["SUBSCRIBE", "news"]),
-            &mut count,
+            &mut conn,
             subs.clone(),
-            &mut tasks,
-            &fwd_tx,
         ).await;
 
         let resp = handle_publish_cmd(
@@ -1210,7 +1194,7 @@ mod pub_sub {
         assert_eq!(resp, RespValue::Integer(1));
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let received = fwd_rx.try_recv().expect("expected a forwarded message");
+        let received = conn.fwd_rx.try_recv().expect("expected a forwarded message");
         assert_eq!(received.channel, "news");
         assert_eq!(received.value, RespValue::BulkString(b"hello".to_vec()));
     }
@@ -1230,17 +1214,14 @@ mod pub_sub {
     #[tokio::test]
     async fn unsubscribe_decrements_count_and_returns_confirmation() {
         let subs = make_subscriptions();
-        let mut tasks = make_channel_tasks();
-        let (tx, _rx) = mpsc::channel::<RecvValue>(16);
-        let mut count = 0usize;
+        let mut conn = ConnectionState::new();
 
-        handle_subscribe_cmd(&cmd(&["SUBSCRIBE", "ch1"]), &mut count, subs.clone(), &mut tasks, &tx).await;
-        handle_subscribe_cmd(&cmd(&["SUBSCRIBE", "ch2"]), &mut count, subs.clone(), &mut tasks, &tx).await;
+        handle_subscribe_cmd(&cmd(&["SUBSCRIBE", "ch1"]), &mut conn, subs.clone()).await;
+        handle_subscribe_cmd(&cmd(&["SUBSCRIBE", "ch2"]), &mut conn, subs.clone()).await;
 
         let resp = handle_unsubscribe_cmd(
             &cmd(&["UNSUBSCRIBE", "ch1"]),
-            &mut count,
-            &mut tasks,
+            &mut conn,
         ).await;
 
         assert_eq!(
@@ -1253,7 +1234,7 @@ mod pub_sub {
                 d
             })
         );
-        assert_eq!(count, 1);
+        assert_eq!(conn.subscribed_count, 1);
     }
 
     #[tokio::test]
@@ -1274,21 +1255,17 @@ mod pub_sub {
     #[tokio::test]
     async fn publish_to_multiple_subscribers_delivers_to_all() {
         let subs = make_subscriptions();
-        let mut tasks1 = make_channel_tasks();
-        let mut tasks2 = make_channel_tasks();
-        let (tx1, mut rx1) = mpsc::channel::<RecvValue>(16);
-        let (tx2, mut rx2) = mpsc::channel::<RecvValue>(16);
-        let mut count1 = 0usize;
-        let mut count2 = 0usize;
+        let mut conn1 = ConnectionState::new();
+        let mut conn2 = ConnectionState::new();
 
-        handle_subscribe_cmd(&cmd(&["SUBSCRIBE", "sports"]), &mut count1, subs.clone(), &mut tasks1, &tx1).await;
-        handle_subscribe_cmd(&cmd(&["SUBSCRIBE", "sports"]), &mut count2, subs.clone(), &mut tasks2, &tx2).await;
+        handle_subscribe_cmd(&cmd(&["SUBSCRIBE", "sports"]), &mut conn1, subs.clone()).await;
+        handle_subscribe_cmd(&cmd(&["SUBSCRIBE", "sports"]), &mut conn2, subs.clone()).await;
 
         let resp = handle_publish_cmd(&cmd(&["PUBLISH", "sports", "goal"]), subs).await;
         assert_eq!(resp, RespValue::Integer(2));
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert!(rx1.try_recv().is_ok());
-        assert!(rx2.try_recv().is_ok());
+        assert!(conn1.fwd_rx.try_recv().is_ok());
+        assert!(conn2.fwd_rx.try_recv().is_ok());
     }
 }
