@@ -8,12 +8,13 @@ use redis_rs::task_communication::Channels;
 use redis_rs::replication::{ReplicationState, ReplicationStateHandle};
 use redis_rs::persistence::{PersistenceState, PersistenceStateHandle, load_from_rdb};
 use redis_rs::pub_sub::Subscriptions;
+use redis_rs::authentication::{UsersAuth};
 use redis_rs::{
-    handle_blpop_cmd, handle_config_cmd, handle_echo_cmd, handle_get_cmd, handle_incr_cmd,
-    handle_info_cmd, handle_keys_cmd, handle_llen_cmd, handle_lpop_cmd, handle_lpush_cmd,
-    handle_lrange_cmd, handle_ping_cmd, handle_publish_cmd, handle_replconf_cmd, handle_rpush_cmd,
-    handle_set_cmd, handle_subscribe_cmd, handle_unsubscribe_cmd, handle_type_cmd,
-    handle_xadd_cmd, handle_xrange_cmd, handle_xread_cmd,
+    handle_acl_cmds, handle_auth_cmd, handle_blpop_cmd, handle_config_cmd, handle_echo_cmd,
+    handle_get_cmd, handle_incr_cmd, handle_info_cmd, handle_keys_cmd, handle_llen_cmd,
+    handle_lpop_cmd, handle_lpush_cmd, handle_lrange_cmd, handle_ping_cmd, handle_publish_cmd,
+    handle_replconf_cmd, handle_rpush_cmd, handle_set_cmd, handle_subscribe_cmd,
+    handle_unsubscribe_cmd, handle_type_cmd, handle_xadd_cmd, handle_xrange_cmd, handle_xread_cmd,
 };
 
 fn make_storage() -> Storage {
@@ -402,7 +403,7 @@ mod lpop {
             "raspberry",
             &["mango", "orange", "pineapple", "raspberry", "pear", "apple", "strawberry"],
         )
-        .await;
+            .await;
         assert_eq!(
             handle_lpop_cmd(&cmd(&["LPOP", "raspberry"]), s.clone()).await,
             RespValue::BulkString(b"mango".to_vec())
@@ -447,7 +448,7 @@ mod llen {
             s.clone(),
             c,
         )
-        .await;
+            .await;
         assert_eq!(handle_llen_cmd(&cmd(&["LLEN", "orange"]), s.clone()).await, RespValue::Integer(5));
         assert_eq!(handle_llen_cmd(&cmd(&["LLEN", "missing_key"]), s).await, RespValue::Integer(0));
     }
@@ -524,7 +525,7 @@ mod xadd {
             make_storage(),
             make_channels(),
         )
-        .await;
+            .await;
         assert!(matches!(&resp, RespValue::SimpleError(s) if s.contains("greater than 0-0")));
     }
 
@@ -565,7 +566,7 @@ mod xadd {
             make_storage(),
             make_channels(),
         )
-        .await;
+            .await;
         if let RespValue::BulkString(bytes) = resp {
             let id = String::from_utf8(bytes).unwrap();
             let parts: Vec<&str> = id.split('-').collect();
@@ -706,7 +707,7 @@ mod xread {
             &cmd(&["XREAD", "streams", "grape", "banana", "0-0", "0-1"]),
             s, c,
         )
-        .await;
+            .await;
         assert_eq!(outer_len(&resp), 2);
     }
 
@@ -1267,5 +1268,188 @@ mod pub_sub {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(conn1.fwd_rx.try_recv().is_ok());
         assert!(conn2.fwd_rx.try_recv().is_ok());
+    }
+}
+
+mod authentication {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+    use redis_rs::ConnectionState;
+
+    fn make_users_auth() -> UsersAuth {
+        Arc::new(RwLock::new(HashMap::new()))
+    }
+
+    #[tokio::test]
+    async fn acl_getuser_default_initial_state() {
+        let users = make_users_auth();
+        let mut conn = ConnectionState::new();
+
+        let resp = handle_acl_cmds(&cmd(&["ACL", "GETUSER", "default"]), &mut conn, users).await;
+
+        let RespValue::Array(ref fields) = resp else {
+            panic!("expected Array, got {:?}", resp);
+        };
+        let fields: Vec<_> = fields.iter().collect();
+
+        assert_eq!(fields[0], &RespValue::BulkString(b"flags".to_vec()));
+
+        let RespValue::Array(flags) = fields[1] else {
+            panic!("expected Array for flags");
+        };
+        assert!(flags.iter().any(|f| f == &RespValue::BulkString(b"nopass".to_vec())),
+                "nopass flag should be present for default user before password is set");
+
+        assert_eq!(fields[2], &RespValue::BulkString(b"passwords".to_vec()));
+
+        let RespValue::Array(passwords) = fields[3] else {
+            panic!("expected Array for passwords");
+        };
+        assert!(passwords.is_empty(), "passwords should be empty before ACL SETUSER");
+    }
+
+    #[tokio::test]
+    async fn acl_setuser_adds_password_hash_and_removes_nopass() {
+        let users = make_users_auth();
+        let mut conn = ConnectionState::new();
+
+        let setuser_resp = handle_acl_cmds(
+            &cmd(&["ACL", "SETUSER", "default", ">grape-520"]),
+            &mut conn,
+            users.clone(),
+        ).await;
+        assert_eq!(setuser_resp, RespValue::SimpleString("OK".into()));
+
+        let getuser_resp = handle_acl_cmds(
+            &cmd(&["ACL", "GETUSER", "default"]),
+            &mut conn,
+            users,
+        ).await;
+
+        let RespValue::Array(ref fields) = getuser_resp else {
+            panic!("expected Array");
+        };
+        let fields: Vec<_> = fields.iter().collect();
+
+        let RespValue::Array(flags) = fields[1] else { panic!() };
+        assert!(!flags.iter().any(|f| f == &RespValue::BulkString(b"nopass".to_vec())),
+                "nopass flag should be absent after password is set");
+
+        let RespValue::Array(passwords) = fields[3] else { panic!() };
+        assert_eq!(passwords.len(), 1);
+        if let RespValue::BulkString(ref hash_bytes) = passwords[0] {
+            let hash = String::from_utf8(hash_bytes.clone()).unwrap();
+            assert_eq!(hash.len(), 64, "password hash should be a 64-char hex SHA-256 digest");
+        } else {
+            panic!("expected BulkString for password hash");
+        }
+    }
+
+    #[tokio::test]
+    async fn acl_whoami_returns_default() {
+        let users = make_users_auth();
+        let mut conn = ConnectionState::new();
+
+        let resp = handle_acl_cmds(&cmd(&["ACL", "WHOAMI"]), &mut conn, users).await;
+        assert_eq!(resp, RespValue::BulkString(b"default".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn auth_wrong_password_returns_wrongpass() {
+        let users = make_users_auth();
+        let mut conn = ConnectionState::new();
+
+        handle_acl_cmds(
+            &cmd(&["ACL", "SETUSER", "default", ">mango-793"]),
+            &mut conn,
+            users.clone(),
+        ).await;
+
+        let resp = handle_auth_cmd(
+            &cmd(&["AUTH", "default", "wrongpassword"]),
+            &mut conn,
+            users,
+        ).await;
+        assert_eq!(
+            resp,
+            RespValue::SimpleError(
+                "WRONGPASS invalid username-password pair or user is disabled.".into()
+            )
+        );
+        assert!(!conn.authenticated, "connection should not be authenticated after WRONGPASS");
+    }
+
+    #[tokio::test]
+    async fn auth_correct_password_returns_ok_and_authenticates() {
+        let users = make_users_auth();
+        let mut conn = ConnectionState::new();
+
+        conn.authenticated = false;
+
+        handle_acl_cmds(
+            &cmd(&["ACL", "SETUSER", "default", ">mango-793"]),
+            &mut conn,
+            users.clone(),
+        ).await;
+
+        let resp = handle_auth_cmd(
+            &cmd(&["AUTH", "default", "mango-793"]),
+            &mut conn,
+            users,
+        ).await;
+        assert_eq!(resp, RespValue::SimpleString("OK".into()));
+        assert!(conn.authenticated, "connection should be authenticated after correct AUTH");
+    }
+
+    #[tokio::test]
+    async fn new_connection_unauthenticated_after_password_set() {
+        let users = make_users_auth();
+        let mut setup_conn = ConnectionState::new();
+
+        handle_acl_cmds(
+            &cmd(&["ACL", "SETUSER", "default", ">apple-681"]),
+            &mut setup_conn,
+            users.clone(),
+        ).await;
+
+        let authenticated = {
+            let guard = users.read().await;
+            match guard.get("default") {
+                Some(user_info) => user_info.nopass,
+                None => true,
+            }
+        };
+        assert!(!authenticated,
+                "new connection should not be pre-authenticated once a password has been set");
+    }
+
+    #[tokio::test]
+    async fn authenticated_connection_can_set_and_get() {
+        let users = make_users_auth();
+        let storage = make_storage();
+        let repl = make_repl_state();
+        let mut conn = ConnectionState::new();
+
+        handle_acl_cmds(
+            &cmd(&["ACL", "SETUSER", "default", ">apple-681"]),
+            &mut conn,
+            users.clone(),
+        ).await;
+
+        conn.authenticated = false;
+        handle_auth_cmd(&cmd(&["AUTH", "default", "apple-681"]), &mut conn, users).await;
+        assert!(conn.authenticated);
+
+        let set_resp = handle_set_cmd(
+            &cmd(&["SET", "key-316", "value-565"]),
+            storage.clone(),
+            repl,
+        ).await;
+        assert_eq!(set_resp, RespValue::SimpleString("OK".into()));
+
+        let get_resp = handle_get_cmd(&cmd(&["GET", "nonexistent-key"]), storage).await;
+        assert_eq!(get_resp, RespValue::NullBulkString);
     }
 }

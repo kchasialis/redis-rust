@@ -4,7 +4,7 @@ A Redis server clone implemented from scratch in Rust. The server implements the
 
 ## Architecture
 
-- **Async I/O** — Each client connection runs in its own Tokio task and yields CPU when waiting for I/O to other tasks. 
+- **Async I/O** — Each client connection runs in its own Tokio task and yields CPU when waiting for I/O to other tasks.
 - **Shared state** — In-memory storage is a `HashMap` wrapped in `Arc<RwLock<...>>`, allowing safe concurrent reads and serialized writes across tasks.
 - **Inter-task communication** — Blocking commands (`BLPOP`, blocking `XREAD`) use Tokio `mpsc` channels. A per-key queue is used for senders so that the first writer wakes the first waiter in FIFO order.
 - **RESP parser** — A handwritten RESP v2/v3 parser handles serialization and deserialization of all protocol types.
@@ -75,6 +75,15 @@ Commands issued after `MULTI` return `QUEUED` and are executed atomically when `
 | `UNSUBSCRIBE` | `UNSUBSCRIBE <channel>` | Unsubscribe from a channel |
 | `PUBLISH` | `PUBLISH <channel> <message>` | Publish a message to all subscribers; returns subscriber count |
 
+### Authentication (ACL)
+
+| Command | Syntax | Description |
+|---------|--------|-------------|
+| `ACL WHOAMI` | `ACL WHOAMI` | Returns the username of the current connection |
+| `ACL GETUSER` | `ACL GETUSER <username>` | Returns the `flags` and `passwords` fields for a user. The default user starts with `nopass` and an empty passwords list |
+| `ACL SETUSER` | `ACL SETUSER <username> ><password>` | Sets a password on a user (SHA-256 hashed). Clears the `nopass` flag |
+| `AUTH` | `AUTH <username> <password>` | Authenticates the current connection. Returns `OK` on success or `WRONGPASS` on failure |
+
 ## Replication
 
 The server supports a **master-replica** topology. A replica is started by passing `--replicaof <host> <port>`.
@@ -115,6 +124,7 @@ If the master offset is still 0 (no writes have occurred), `WAIT` returns the to
 - **RDB transfer** — The master sends a minimal valid empty RDB file immediately after `FULLRESYNC` using the standard `$<len>\r\n<bytes>` framing (no trailing `\r\n`, as per the Redis wire format).
 - **RESP protocol** — Full RESP v2 support plus v3 types (Boolean, Double, BigNumber, BulkError, Map, Set, VerbatimString).
 - **Pub/Sub** — A client entering subscribe mode is restricted to `SUBSCRIBE`, `UNSUBSCRIBE`, and `PING`. The connection loop uses `tokio::select!` to simultaneously wait for new client commands and for messages forwarded from the broadcast channel, ensuring message delivery without blocking.
+- **ACL / Authentication** — A global `UsersAuth` registry maps usernames to `UserInfo` (password hashes, `nopass` flag, enabled status). The default user starts with `nopass=true` (no password required). Once `ACL SETUSER default >password` is called, `nopass` is cleared and new connections must authenticate via `AUTH` before issuing other commands. Passwords are stored as SHA-256 hex digests.
 
 ## Build & Run
 
@@ -153,6 +163,12 @@ redis-cli exec
 # Replication info
 redis-cli info replication
 redis-cli wait 1 500
+
+# ACL / Authentication
+redis-cli acl whoami
+redis-cli acl setuser default ">mysecret"
+redis-cli auth default mysecret
+redis-cli acl getuser default
 ```
 
 ## Testing
@@ -167,6 +183,7 @@ cargo test
 cargo test ping
 cargo test persistence
 cargo test pub_sub
+cargo test authentication
 ```
 
 ## License

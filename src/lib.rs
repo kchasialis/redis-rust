@@ -1011,6 +1011,7 @@ pub async fn handle_auth_cmd(arr: &Vec<RespValue>, conn: &mut ConnectionState, u
         }
     }
 
+    conn.authenticated = false;
     RespValue::SimpleError("WRONGPASS invalid username-password pair or user is disabled.".to_string())
 }
 
